@@ -1,0 +1,12 @@
+[
+  {"dep": "urllib3 <1.26.19", "cve": "CVE-2024-37891 — HTTP redirect race condition (CVSS 6.1)"},
+  {"dep": "requests <2.32.0", "cve": "CVE-2024-35195 — content-length mismatch (CVSS 5.9)"},
+  {"dep": "cryptography <42.0.0", "cve": "CVE-2024-26131 — null-pointer dereference in X.509 (CVSS 5.5)"},
+  {"dep": "jinja2 <3.1.5", "cve": "CVE-2025-27516 — SSTI via template filename injection (CVSS 7.5)"},
+  {"dep": "werkzeug <3.0.6", "cve": "CVE-2024-49766 — DoS via malicious multipart data (CVSS 7.5)"},
+  {"dep": "dask <2024.8.1", "cve": "CVE-2024-45187 — remote code execution via untrusted YAML (CVSS 9.8)"},
+  {"dep": "pyarrow <15.0.2", "cve": "CVE-2024-39135 — buffer overflow in IPC (CVSS 7.3)"},
+  {"dep": "pandas <2.2.1", "cve": "CVE-2024-42992 — zip slip in read_parquet (CVSS 5.5)"},
+  {"dep": "aiohttp <3.10.11", "cve": "CVE-2024-52304 — request smuggling via chunked encoding (CVSS 7.5)"},
+  {"dep": "fsspec <2024.10.0", "cve": "CVE-2024-40332 — path traversal in HTTP filesystem (CVSS 6.5)"}
+]

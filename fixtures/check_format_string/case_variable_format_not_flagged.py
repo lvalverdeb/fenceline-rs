@@ -1,0 +1,1 @@
+msg = template.format(name)

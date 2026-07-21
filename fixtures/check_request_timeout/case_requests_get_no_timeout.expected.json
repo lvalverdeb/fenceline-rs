@@ -1,0 +1,10 @@
+{
+  "findings": [
+    {
+      "cwe_id": "CWE-1088",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 1
+    }
+  ]
+}

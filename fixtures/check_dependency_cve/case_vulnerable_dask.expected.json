@@ -1,0 +1,11 @@
+{
+  "findings": [
+    {
+      "cwe_id": "CWE-1104",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 1
+    }
+  ],
+  "path_name": "pyproject.toml"
+}
