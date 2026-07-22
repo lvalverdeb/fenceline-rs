@@ -281,10 +281,10 @@ pub fn skip(line: &str) -> bool {
 // module-level constants, and library references, with no dependency on
 // this function's own parameters or any other name we can't account for?"
 
-/// `(name -> assigned value, names bound by import statements)` for every
-/// simple `Name = value`/`Name: T = value` assignment and
-/// `import`/`from ... import` statement directly in `stmts` -- mirrors
-/// `ast_helpers._collect_scope_names`.
+/// `(name -> assigned value, names bound by import statements or sibling
+/// function definitions)` for every simple `Name = value`/`Name: T = value`
+/// assignment, `import`/`from ... import` statement, and `def`/`async def`
+/// directly in `stmts` -- mirrors `ast_helpers._collect_scope_names`.
 pub fn collect_scope_names(stmts: &[Stmt]) -> (HashMap<String, Expr>, HashSet<String>) {
     let mut collector = ScopeNamesCollector {
         literals: HashMap::new(),
@@ -302,8 +302,20 @@ struct ScopeNamesCollector {
 }
 
 impl Visitor for ScopeNamesCollector {
-    fn visit_stmt_function_def(&mut self, _node: StmtFunctionDef) {}
-    fn visit_stmt_async_function_def(&mut self, _node: StmtAsyncFunctionDef) {}
+    // A locally-defined helper function's *name* is folded into the same
+    // "known safe reference" set as imports: calling `build_request(BASE,
+    // path)` only depends on whether `BASE`/`path` are themselves safe
+    // (checked recursively via each argument), exactly like calling
+    // `requests.get(...)` doesn't require inspecting `requests`' own
+    // internals. Without this, routing a call through any local helper
+    // function -- rather than inlining it -- made `is_locally_safe_expr`
+    // treat the whole expression as unsafe regardless of its arguments.
+    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
+        self.imports.insert(node.name.to_string());
+    }
+    fn visit_stmt_async_function_def(&mut self, node: StmtAsyncFunctionDef) {
+        self.imports.insert(node.name.to_string());
+    }
     fn visit_stmt_class_def(&mut self, _node: StmtClassDef) {}
     fn visit_expr_lambda(&mut self, _node: ExprLambda) {}
 

@@ -154,7 +154,8 @@ impl ConfidenceMin {
 #[derive(Parser, Debug)]
 #[command(
     name = "fenceline",
-    about = "Zero-day vulnerability scanner for the workspace"
+    about = "Zero-day vulnerability scanner for the workspace",
+    version
 )]
 pub struct Args {
     /// JSON output
@@ -190,6 +191,13 @@ pub struct Args {
     /// code paths are unaffected either way.
     #[arg(long)]
     pub include_tests: bool,
+
+    /// Extra directory names to treat as non-production for the same
+    /// CWE-category suppression --include-tests governs, alongside the
+    /// built-in tests/test/conftest.py conventions (e.g. --test-paths
+    /// evaluation benchmarks). Ignored if --include-tests is also given.
+    #[arg(long, value_name = "DIRNAME", num_args = 0..)]
+    pub test_paths: Vec<String>,
 
     /// Only report/fail on findings not already present in this baseline file
     #[arg(long, value_name = "PATH")]
@@ -408,7 +416,9 @@ pub fn run(args: &Args) -> i32 {
     if !args.include_tests {
         let mut kept = Vec::with_capacity(all_findings.len());
         for f in all_findings {
-            if TEST_DEPRIORITIZED_CWES.contains(&f.cwe_id) && is_test_path(&f.file) {
+            if TEST_DEPRIORITIZED_CWES.contains(&f.cwe_id)
+                && is_test_path(&f.file, &args.test_paths)
+            {
                 test_suppressed += 1;
             } else {
                 kept.push(f);

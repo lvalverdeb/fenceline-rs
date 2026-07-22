@@ -43,6 +43,23 @@ struct ReportPayload<'a> {
     nosec_suppressed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     test_suppressed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suppression_hint: Option<&'static str>,
+}
+
+// Real-world feedback: a reader who only ever looks at --json output has no
+// way to discover # nosec/--baseline exist at all -- the equivalent
+// text-mode footer hint never reaches them.
+const SUPPRESSION_HINT: &str = "Confirmed a finding is a false positive or accepted risk? Suppress it with \
+     # nosec [CWE-ID] on that line, or adopt fenceline on an existing codebase \
+     with --write-baseline/--baseline — see README.md.";
+
+fn suppression_hint(
+    has_findings: bool,
+    baseline_suppressed: usize,
+    nosec_suppressed: usize,
+) -> Option<&'static str> {
+    (has_findings && baseline_suppressed == 0 && nosec_suppressed == 0).then_some(SUPPRESSION_HINT)
 }
 
 pub fn print_report(
@@ -73,6 +90,11 @@ pub fn print_report(
             baseline_suppressed: (baseline_suppressed > 0).then_some(baseline_suppressed),
             nosec_suppressed: (nosec_suppressed > 0).then_some(nosec_suppressed),
             test_suppressed: (test_suppressed > 0).then_some(test_suppressed),
+            suppression_hint: suppression_hint(
+                !all_findings.is_empty(),
+                baseline_suppressed,
+                nosec_suppressed,
+            ),
         };
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
         return;
@@ -313,11 +335,13 @@ mod tests {
             baseline_suppressed: None,
             nosec_suppressed: None,
             test_suppressed: None,
+            suppression_hint: None,
         };
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(!serialized.contains("baseline_suppressed"));
         assert!(!serialized.contains("nosec_suppressed"));
         assert!(!serialized.contains("test_suppressed"));
+        assert!(!serialized.contains("suppression_hint"));
     }
 
     #[test]
@@ -328,10 +352,29 @@ mod tests {
             baseline_suppressed: Some(3),
             nosec_suppressed: Some(2),
             test_suppressed: Some(1),
+            suppression_hint: None,
         };
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(serialized.contains("\"baseline_suppressed\":3"));
         assert!(serialized.contains("\"nosec_suppressed\":2"));
         assert!(serialized.contains("\"test_suppressed\":1"));
+    }
+
+    #[test]
+    fn suppression_hint_present_when_findings_exist_and_none_suppressed_yet() {
+        let hint = suppression_hint(true, 0, 0).unwrap();
+        assert!(hint.contains("# nosec"));
+        assert!(hint.contains("--baseline"));
+    }
+
+    #[test]
+    fn suppression_hint_absent_once_suppression_is_already_in_use() {
+        assert!(suppression_hint(true, 0, 2).is_none());
+        assert!(suppression_hint(true, 3, 0).is_none());
+    }
+
+    #[test]
+    fn suppression_hint_absent_when_no_findings() {
+        assert!(suppression_hint(false, 0, 0).is_none());
     }
 }
