@@ -1,6 +1,6 @@
 [package]
 name = "fenceline"
-version = "0.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "Zero-day security scanner for Python codebases, in Rust"
 license = "MIT"
