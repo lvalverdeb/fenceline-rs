@@ -1,7 +1,6 @@
-//! Workspace-root discovery, the default scan-target package registry, and
+//! Workspace-root discovery, the path-security sandbox check, and
 //! dependency-manifest filenames -- mirrors `fenceline/config.py`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Dependency-manifest filenames probed alongside each package's source tree
@@ -54,10 +53,8 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
 /// exist* -- `std::fs::canonicalize` (used here) errors on a nonexistent
 /// path instead. In practice this only matters for a path that doesn't
 /// exist yet, where this function now fails closed (treats it as insecure)
-/// rather than resolving it anyway the way Python does. `default_packages`
-/// below only ever calls this on real, existing package directories, so
-/// this divergence doesn't bite there; it would matter for a future
-/// `--package NAME=PATH` (Phase 4) pointed at a not-yet-created path.
+/// rather than resolving it anyway the way Python does; it matters for
+/// `--package NAME=PATH` pointed at a not-yet-created path.
 pub fn is_secure_path(target: &Path, allowed_dirs: &[&Path]) -> bool {
     let Ok(target) = target.canonicalize() else {
         return false;
@@ -67,26 +64,6 @@ pub fn is_secure_path(target: &Path, allowed_dirs: &[&Path]) -> bool {
             .canonicalize()
             .is_ok_and(|allowed| target.starts_with(allowed))
     })
-}
-
-/// Every default scan target must resolve inside `workspace_root` -- mirrors
-/// `config.py::DEFAULT_PACKAGES`'s `is_secure_path` filter. Empty when
-/// `workspace_root` is `None`: there's nothing to default to, the caller
-/// must pass an explicit target instead (Phase 4's `--package`).
-pub fn default_packages(workspace_root: Option<&Path>) -> BTreeMap<String, PathBuf> {
-    let Some(root) = workspace_root else {
-        return BTreeMap::new();
-    };
-    [
-        ("boti", "boti/src/boti"),
-        ("boti-data", "boti-data/src/boti_data"),
-        ("boti-dask", "boti-dask/src/boti_dask"),
-        ("fenceline", "fenceline/src/fenceline"),
-    ]
-    .into_iter()
-    .map(|(name, rel)| (name.to_string(), root.join(rel)))
-    .filter(|(_, path)| is_secure_path(path, &[root]))
-    .collect()
 }
 
 #[cfg(test)]
@@ -145,24 +122,5 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         assert!(!is_secure_path(other.path(), &[tmp.path()]));
-    }
-
-    #[test]
-    fn default_packages_resolve_inside_workspace_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        for pkg in ["boti", "boti-data", "boti-dask", "fenceline"] {
-            let src_name = pkg.replace('-', "_");
-            std::fs::create_dir_all(tmp.path().join(pkg).join("src").join(&src_name)).unwrap();
-        }
-        let packages = default_packages(Some(tmp.path()));
-        assert_eq!(packages.len(), 4);
-        for path in packages.values() {
-            assert!(path.starts_with(tmp.path()));
-        }
-    }
-
-    #[test]
-    fn default_packages_empty_when_no_workspace_root() {
-        assert!(default_packages(None).is_empty());
     }
 }
