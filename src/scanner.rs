@@ -36,14 +36,34 @@ pub fn is_self_scan_exclusion(path: &Path) -> bool {
 }
 
 /// Every `.py` file under `root`, sorted for deterministic output --
-/// mirrors `scanner.py::_iter_py`'s `sorted(root.rglob("*.py"))`.
-pub fn iter_py(root: &Path) -> Vec<PathBuf> {
-    WalkDir::new(root)
+/// mirrors `scanner.py::_iter_py`.
+///
+/// `recursive: false` walks only `root` itself (one level), not its
+/// subdirectories -- used for the cwd auto-discovery "loose root" package,
+/// whose files sit directly in the invoking directory while its
+/// subdirectories are already registered as their own separate packages
+/// (scanning both would double-count them).
+///
+/// `exclude` is a list of path-substring patterns (e.g. `"/.venv/"`) to
+/// skip, same convention as `scanner.py`'s own `exclude` parameter --
+/// lets cwd auto-discovery step around virtualenvs, caches, and vendored
+/// dependency trees nested under a scanned directory.
+pub fn iter_py(root: &Path, recursive: bool, exclude: &[&str]) -> Vec<PathBuf> {
+    let walker = if recursive {
+        WalkDir::new(root)
+    } else {
+        WalkDir::new(root).max_depth(1)
+    };
+    walker
         .sort_by_file_name()
         .into_iter()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.into_path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "py"))
+        .filter(|path| {
+            let path_str = path.to_string_lossy();
+            !path_str.contains("__pycache__") && !exclude.iter().any(|p| path_str.contains(p))
+        })
         .filter(|path| !is_self_scan_exclusion(path))
         .collect()
 }
@@ -130,11 +150,41 @@ mod tests {
         std::fs::write(pkg.join("cli.py"), "import sys\n").unwrap();
         std::fs::write(pkg.join("scanner.py"), "import ast\n").unwrap();
 
-        let found: Vec<String> = iter_py(&pkg)
+        let found: Vec<String> = iter_py(&pkg, true, &[])
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(found, vec!["cli.py".to_string(), "scanner.py".to_string()]);
+    }
+
+    #[test]
+    fn iter_py_non_recursive_only_scans_root_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("root.py"), "x = 1\n").unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("deep.py"), "y = 2\n").unwrap();
+
+        let found: Vec<String> = iter_py(tmp.path(), false, &[])
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(found, vec!["root.py".to_string()]);
+    }
+
+    #[test]
+    fn iter_py_exclude_patterns_skip_matching_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let venv = tmp.path().join(".venv").join("lib");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(venv.join("vendored.py"), "x = 1\n").unwrap();
+        std::fs::write(tmp.path().join("real.py"), "y = 2\n").unwrap();
+
+        let found: Vec<String> = iter_py(tmp.path(), true, &["/.venv/"])
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(found, vec!["real.py".to_string()]);
     }
 
     #[test]

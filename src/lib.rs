@@ -1,6 +1,9 @@
 pub mod ast_helpers;
+pub mod baseline;
 pub mod checks;
+pub mod cli;
 pub mod config;
 pub mod models;
 pub mod reporting;
 pub mod scanner;
+pub mod suppression;

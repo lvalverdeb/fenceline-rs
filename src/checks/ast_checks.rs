@@ -46,6 +46,12 @@ struct CallRec {
     /// `re.compile(...)` or a SQLAlchemy-style `.compile()` -- both
     /// excluded from `check_eval_exec`'s bare-`compile()` rule.
     is_excluded_compile: bool,
+    /// Line of the `allow_pickle=True` keyword's own *value* node, if
+    /// present -- mirrors `ast_checks.py::_allow_pickle_kw_line`, which
+    /// deliberately reports the value's line rather than the call's own
+    /// (opening-paren) line, so a multi-line call flags the line the
+    /// dangerous keyword actually sits on.
+    allow_pickle_kw_line: Option<usize>,
 }
 
 struct ExceptRec {
@@ -61,7 +67,12 @@ struct FuncDefRec {
     line: usize,
     name: String,
     is_plain_function_def: bool,
-    params: Vec<(String, Option<bool>)>,
+    /// `(param name, is-default-True, default's own line)` -- the third
+    /// field mirrors `ast_checks.py::_allow_pickle_default_lines`, which
+    /// reports the default value's own line rather than the `def`
+    /// statement's line, so a multi-line signature flags the line the
+    /// dangerous default actually sits on.
+    params: Vec<(String, Option<bool>, Option<usize>)>,
 }
 
 struct AssignRec {
@@ -83,14 +94,18 @@ struct Collector<'a> {
     out: Collected,
 }
 
-fn params_from_arguments(args: &Arguments) -> Vec<(String, Option<bool>)> {
+fn params_from_arguments(
+    args: &Arguments,
+    li: &LineIndex,
+) -> Vec<(String, Option<bool>, Option<usize>)> {
     args.posonlyargs
         .iter()
         .chain(args.args.iter())
         .chain(args.kwonlyargs.iter())
         .map(|a| {
             let is_true = a.default.as_deref().map(is_true_constant);
-            (a.def.arg.to_string(), is_true)
+            let default_line = a.default.as_deref().map(|d| li.line_number(d.start()));
+            (a.def.arg.to_string(), is_true, default_line)
         })
         .collect()
 }
@@ -112,6 +127,16 @@ impl<'a> Visitor for Collector<'a> {
             .filter(|kw| is_true_constant(&kw.value))
             .filter_map(|kw| kw.arg.as_ref().map(|a| a.to_string()))
             .collect();
+        let allow_pickle_kw_line = node
+            .keywords
+            .iter()
+            .find(|kw| {
+                kw.arg
+                    .as_ref()
+                    .is_some_and(|a| a.as_str() == "allow_pickle")
+                    && is_true_constant(&kw.value)
+            })
+            .map(|kw| self.li.line_number(kw.value.start()));
         let first_arg_call_full_attr = node.args.first().and_then(|a| {
             if let Expr::Call(c) = a {
                 Some(full_attr(&c.func))
@@ -134,6 +159,7 @@ impl<'a> Visitor for Collector<'a> {
             keyword_true_names,
             first_arg_call_full_attr,
             is_excluded_compile,
+            allow_pickle_kw_line,
         });
         self.generic_visit_expr_call(node);
     }
@@ -163,7 +189,7 @@ impl<'a> Visitor for Collector<'a> {
             line,
             name: node.name.to_string(),
             is_plain_function_def: true,
-            params: params_from_arguments(&node.args),
+            params: params_from_arguments(&node.args, self.li),
         });
         self.generic_visit_stmt_function_def(node);
     }
@@ -174,7 +200,7 @@ impl<'a> Visitor for Collector<'a> {
             line,
             name: node.name.to_string(),
             is_plain_function_def: false,
-            params: params_from_arguments(&node.args),
+            params: params_from_arguments(&node.args, self.li),
         });
         self.generic_visit_stmt_async_function_def(node);
     }
@@ -438,8 +464,8 @@ pub fn check_insecure_default(
     let mut flagged_lines: Vec<usize> = Vec::new();
 
     for call in &collected.calls {
-        if call.keyword_true_names.iter().any(|n| n == "allow_pickle") {
-            flagged_lines.push(call.line);
+        if let Some(line) = call.allow_pickle_kw_line {
+            flagged_lines.push(line);
         }
     }
     for a in collected.assigns.iter().chain(collected.ann_assigns.iter()) {
@@ -448,9 +474,9 @@ pub fn check_insecure_default(
         }
     }
     for f in &collected.funcdefs {
-        for (name, is_true) in &f.params {
+        for (name, is_true, default_line) in &f.params {
             if name == "allow_pickle" && *is_true == Some(true) {
-                flagged_lines.push(f.line);
+                flagged_lines.push(default_line.unwrap_or(f.line));
             }
         }
     }

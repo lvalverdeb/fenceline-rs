@@ -17,6 +17,7 @@ name = "fenceline"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4.5.51", features = ["derive"] }
 regex = "1.13.1"
 rustpython-ast = { version = "0.4.0", features = ["unparse", "visitor"] }
 rustpython-parser = "0.4.0"
