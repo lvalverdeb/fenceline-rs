@@ -108,6 +108,10 @@ pub fn checks() -> Vec<(&'static str, CheckFn)> {
             "HuggingFace Unsafe Download (OWASP ML06 / B615)",
             check_huggingface_unsafe_download,
         ),
+        (
+            "Unbounded Request Field Size (OWASP API4:2023 / CWE-770)",
+            check_unbounded_pydantic_field,
+        ),
     ]
 }
 
@@ -184,5 +188,6 @@ pub fn checks_by_name() -> Vec<(&'static str, CheckFn)> {
         check_weak_tls_version,
         check_legacy_pycrypto,
         check_huggingface_unsafe_download,
+        check_unbounded_pydantic_field,
     ]
 }

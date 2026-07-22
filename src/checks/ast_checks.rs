@@ -16,8 +16,8 @@ use crate::models::{Confidence, Finding, Severity};
 use regex::Regex;
 use rustpython_ast::{
     Arguments, Comprehension, Constant, ExceptHandlerExceptHandler, Expr, ExprCall, Keyword,
-    ModModule, Ranged, Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef, StmtFunctionDef,
-    Visitor, WithItem,
+    ModModule, Ranged, Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef, StmtClassDef,
+    StmtFunctionDef, Visitor, WithItem,
 };
 use std::path::Path;
 use std::sync::LazyLock;
@@ -32,6 +32,123 @@ fn target_is_allow_pickle(target: &Expr) -> bool {
         Expr::Attribute(a) => a.attr.as_str() == "allow_pickle",
         _ => false,
     }
+}
+
+/// Dotted name for a bare `Name`/`Attribute` chain, e.g. `pydantic.BaseModel`
+/// -> `"pydantic.BaseModel"` -- mirrors `full_attr`, but for a general
+/// expression (a class base) rather than specifically a `Call`'s `.func`.
+/// Empty string for anything else (a subscript, a call, ...).
+fn expr_dotted_name(node: &Expr) -> String {
+    let mut parts = Vec::new();
+    let mut cur = node;
+    loop {
+        match cur {
+            Expr::Attribute(a) => {
+                parts.push(a.attr.as_str());
+                cur = &a.value;
+            }
+            Expr::Name(n) => {
+                parts.push(n.id.as_str());
+                parts.reverse();
+                return parts.join(".");
+            }
+            _ => return String::new(),
+        }
+    }
+}
+
+fn is_pydantic_base(node: &Expr) -> bool {
+    let name = expr_dotted_name(node);
+    name == "BaseModel" || name.ends_with(".BaseModel")
+}
+
+/// Pydantic's BaseModel is used for internal config/settings objects just
+/// as often as for network-facing request bodies -- an unbounded str field
+/// on a config class isn't a real attack surface. Narrowing to conventional
+/// request/input-DTO name suffixes (matching FastAPI community convention)
+/// keeps the signal-to-noise ratio usable rather than flagging every
+/// settings class in a codebase. Mirrors
+/// `ast_checks.py::_looks_like_request_model`.
+const REQUEST_MODEL_SUFFIXES: &[&str] = &["Request", "Input", "Payload", "Body", "Params"];
+
+fn looks_like_request_model(class_name: &str) -> bool {
+    REQUEST_MODEL_SUFFIXES
+        .iter()
+        .any(|s| class_name.ends_with(s))
+}
+
+/// `"str"`/`"bytes"` if *annotation* is a bare, `Optional`-wrapped,
+/// `| None`-wrapped, or `Annotated`-wrapped `str`/`bytes` type; `None`
+/// otherwise -- mirrors `ast_checks.py::_str_or_bytes_base_type`.
+fn str_or_bytes_base_type(annotation: &Expr) -> Option<&'static str> {
+    match annotation {
+        Expr::Name(n) if n.id.as_str() == "str" => Some("str"),
+        Expr::Name(n) if n.id.as_str() == "bytes" => Some("bytes"),
+        Expr::Subscript(sub) => {
+            let Expr::Name(base) = sub.value.as_ref() else {
+                return None;
+            };
+            if base.id.as_str() == "Optional"
+                && let Expr::Name(inner) = sub.slice.as_ref()
+            {
+                return match inner.id.as_str() {
+                    "str" => Some("str"),
+                    "bytes" => Some("bytes"),
+                    _ => None,
+                };
+            }
+            if base.id.as_str() == "Annotated"
+                && let Expr::Tuple(tup) = sub.slice.as_ref()
+                && let Some(Expr::Name(first)) = tup.elts.first()
+            {
+                return match first.id.as_str() {
+                    "str" => Some("str"),
+                    "bytes" => Some("bytes"),
+                    _ => None,
+                };
+            }
+            None
+        }
+        Expr::BinOp(bin) if matches!(bin.op, rustpython_ast::Operator::BitOr) => {
+            for side in [bin.left.as_ref(), bin.right.as_ref()] {
+                if let Expr::Name(n) = side {
+                    match n.id.as_str() {
+                        "str" => return Some("str"),
+                        "bytes" => return Some("bytes"),
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn field_call_has_max_length(node: &Expr) -> bool {
+    let Expr::Call(call) = node else { return false };
+    let name = full_attr(&call.func);
+    (name == "Field" || name == "StringConstraints")
+        && call
+            .keywords
+            .iter()
+            .any(|kw| kw.arg.as_ref().is_some_and(|a| a.as_str() == "max_length"))
+}
+
+fn has_length_constraint(annotation: &Expr, default: Option<&Expr>) -> bool {
+    if let Some(value) = default
+        && field_call_has_max_length(value)
+    {
+        return true;
+    }
+    if let Expr::Subscript(sub) = annotation
+        && let Expr::Name(base) = sub.value.as_ref()
+        && base.id.as_str() == "Annotated"
+        && let Expr::Tuple(tup) = sub.slice.as_ref()
+    {
+        return tup.elts.iter().skip(1).any(field_call_has_max_length);
+    }
+    false
 }
 
 struct CallRec {
@@ -80,6 +197,13 @@ struct AssignRec {
     is_allow_pickle_true: bool,
 }
 
+struct PydanticFieldRec {
+    line: usize,
+    field_name: String,
+    base_type: &'static str,
+    has_constraint: bool,
+}
+
 #[derive(Default)]
 struct Collected {
     calls: Vec<CallRec>,
@@ -87,6 +211,7 @@ struct Collected {
     funcdefs: Vec<FuncDefRec>,
     assigns: Vec<AssignRec>,
     ann_assigns: Vec<AssignRec>,
+    pydantic_fields: Vec<PydanticFieldRec>,
 }
 
 struct Collector<'a> {
@@ -203,6 +328,27 @@ impl<'a> Visitor for Collector<'a> {
             params: params_from_arguments(&node.args, self.li),
         });
         self.generic_visit_stmt_async_function_def(node);
+    }
+
+    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        if looks_like_request_model(node.name.as_str()) && node.bases.iter().any(is_pydantic_base) {
+            for stmt in &node.body {
+                if let Stmt::AnnAssign(ann) = stmt
+                    && let Expr::Name(target) = ann.target.as_ref()
+                    && let Some(base_type) = str_or_bytes_base_type(&ann.annotation)
+                {
+                    let has_constraint =
+                        has_length_constraint(&ann.annotation, ann.value.as_deref());
+                    self.out.pydantic_fields.push(PydanticFieldRec {
+                        line: self.li.line_number(ann.start()),
+                        field_name: target.id.to_string(),
+                        base_type,
+                        has_constraint,
+                    });
+                }
+            }
+        }
+        self.generic_visit_stmt_class_def(node);
     }
 
     fn visit_stmt_assign(&mut self, node: StmtAssign) {
@@ -895,4 +1041,38 @@ pub fn check_huggingface_unsafe_download(
         }
     }
     results
+}
+
+// ── check_unbounded_pydantic_field (CWE-770 / OWASP API4:2023) ───────────
+
+pub fn check_unbounded_pydantic_field(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ModModule>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let source = lines.join("\n");
+    let collected = collect(tree, &source);
+
+    collected
+        .pydantic_fields
+        .iter()
+        .filter(|f| !f.has_constraint)
+        .map(|f| Finding {
+            cwe_id: "CWE-770",
+            cwe_name: "Unbounded Request Field Size",
+            severity: Severity::Medium,
+            confidence: Confidence::Medium,
+            package: String::new(),
+            file: pk.to_string(),
+            line: f.line,
+            code_snippet: code_at(lines, f.line),
+            description: format!(
+                "'{}: {}' has no length constraint — a client can send an arbitrarily large value, forcing expensive decode/validation work before any handler logic runs. Add Field(max_length=...) or an Annotated[str, StringConstraints(max_length=...)].",
+                f.field_name, f.base_type
+            ),
+            zero_day_relevance: "OWASP API4:2023: Unrestricted Resource Consumption — unbounded request fields are a common DoS vector in FastAPI/Pydantic APIs.",
+        })
+        .collect()
 }

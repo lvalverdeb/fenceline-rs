@@ -1,0 +1,2 @@
+class NotARequestModel:
+    image: str
