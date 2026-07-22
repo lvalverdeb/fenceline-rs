@@ -6,7 +6,7 @@ use crate::checks::checks;
 use crate::config::{DEP_MANIFEST_FILES, find_workspace_root, is_secure_path};
 use crate::models::{Confidence, Finding, Severity};
 use crate::reporting::print_report;
-use crate::scanner::{ast_parse, iter_py, read_lines, rel};
+use crate::scanner::{ast_parse, is_test_path, iter_py, read_lines, rel};
 use crate::suppression::apply_suppressions;
 use clap::{Parser, ValueEnum};
 use std::collections::BTreeMap;
@@ -29,6 +29,14 @@ pub const DEFAULT_CWD_EXCLUDES: &[&str] = &[
     "/.tox/",
     "/site-packages/",
 ];
+
+/// CWE categories where test-code context (an ephemeral testcontainers
+/// password, a test assertion, a hardcoded localhost URL, a small
+/// committed fixture read) changes the finding from "real risk" to "not
+/// applicable" often enough that treating it identically to a production
+/// hit drowns out genuine findings in the same category -- mirrors
+/// `cli.py::_TEST_DEPRIORITIZED_CWES`.
+const TEST_DEPRIORITIZED_CWES: &[&str] = &["CWE-798", "CWE-617", "CWE-918", "CWE-770"];
 
 const NOISE_DIR_NAMES: &[&str] = &[
     "__pycache__",
@@ -176,6 +184,13 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "low")]
     pub confidence_min: ConfidenceMin,
 
+    /// Include findings for CWE categories that are usually noise in test code
+    /// (CWE-798, CWE-617, CWE-918, CWE-770) when they occur in a tests/ directory,
+    /// test_*.py/*_test.py file, or conftest.py. Off by default; production
+    /// code paths are unaffected either way.
+    #[arg(long)]
+    pub include_tests: bool,
+
     /// Only report/fail on findings not already present in this baseline file
     #[arg(long, value_name = "PATH")]
     pub baseline: Option<PathBuf>,
@@ -247,6 +262,34 @@ fn find_manifest_files(root: &Path, ceiling: Option<&Path>) -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Package name for a manifest file, derived from the file's own parent
+/// directory rather than which package's upward `find_manifest_files`
+/// search happened to reach it first -- mirrors
+/// `cli.py::_manifest_package_label`.
+///
+/// A manifest genuinely local to a package (its parent directory *is* that
+/// package's own root) gets that package's name. A manifest shared above
+/// every package's root — most commonly the scanned project's own
+/// top-level `pyproject.toml`, found by every package's upward walk once
+/// it climbs past its own directory — previously got silently attributed
+/// to whichever package's `entry().or_insert_with` reached it first, an
+/// arbitrary artifact of iteration order rather than anything about the
+/// file itself. Falls back to the manifest's own parent directory name,
+/// which is always at least traceable to where the file actually lives.
+fn manifest_package_label(manifest_path: &Path, packages: &BTreeMap<String, PathBuf>) -> String {
+    let parent = manifest_path.parent();
+    for (name, root) in packages {
+        if Some(root.as_path()) == parent {
+            return name.clone();
+        }
+    }
+    parent
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "root".to_string())
+}
+
 /// Runs the full scan pipeline and returns the process exit code -- mirrors
 /// `cli.py::main`.
 pub fn run(args: &Args) -> i32 {
@@ -311,7 +354,9 @@ pub fn run(args: &Args) -> i32 {
             path_package.entry(path).or_insert_with(|| name.clone());
         }
         for path in find_manifest_files(root, workspace_root.as_deref()) {
-            path_package.entry(path).or_insert_with(|| name.clone());
+            path_package
+                .entry(path.clone())
+                .or_insert_with(|| manifest_package_label(&path, &packages));
         }
     }
 
@@ -359,6 +404,19 @@ pub fn run(args: &Args) -> i32 {
     let conf_threshold = args.confidence_min.confidence();
     all_findings.retain(|f| f.confidence <= conf_threshold);
 
+    let mut test_suppressed = 0usize;
+    if !args.include_tests {
+        let mut kept = Vec::with_capacity(all_findings.len());
+        for f in all_findings {
+            if TEST_DEPRIORITIZED_CWES.contains(&f.cwe_id) && is_test_path(&f.file) {
+                test_suppressed += 1;
+            } else {
+                kept.push(f);
+            }
+        }
+        all_findings = kept;
+    }
+
     if let Some(write_baseline_path) = &args.write_baseline {
         if let Err(err) = write_baseline(&all_findings, write_baseline_path) {
             eprintln!(
@@ -367,7 +425,13 @@ pub fn run(args: &Args) -> i32 {
             );
             return 2;
         }
-        print_report(&mut all_findings, args.json, 0, nosec_suppressed);
+        print_report(
+            &mut all_findings,
+            args.json,
+            0,
+            nosec_suppressed,
+            test_suppressed,
+        );
         if !args.quiet && !args.json {
             println!(
                 "  Wrote baseline with {} finding(s) to {}",
@@ -401,6 +465,7 @@ pub fn run(args: &Args) -> i32 {
         args.json,
         baseline_suppressed,
         nosec_suppressed,
+        test_suppressed,
     );
 
     let threshold = args.fail_on.severity();
@@ -472,5 +537,34 @@ mod tests {
             packages.keys().cloned().collect::<Vec<_>>(),
             vec!["real_pkg".to_string()]
         );
+    }
+
+    #[test]
+    fn manifest_package_label_uses_owning_package_when_manifest_is_local() {
+        let packages: BTreeMap<String, PathBuf> = [
+            ("evaluation".to_string(), PathBuf::from("/proj/evaluation")),
+            ("migrations".to_string(), PathBuf::from("/proj/migrations")),
+        ]
+        .into_iter()
+        .collect();
+        let manifest = PathBuf::from("/proj/evaluation/pyproject.toml");
+        assert_eq!(manifest_package_label(&manifest, &packages), "evaluation");
+    }
+
+    #[test]
+    fn manifest_package_label_falls_back_to_parent_dir_name_for_shared_manifest() {
+        // Real-world bug report: a manifest shared above every package's own
+        // root (the scanned project's top-level pyproject.toml, found by
+        // every package's upward search once it climbs past its own
+        // directory) must not be attributed to whichever package's
+        // entry().or_insert_with reached it first.
+        let packages: BTreeMap<String, PathBuf> = [
+            ("evaluation".to_string(), PathBuf::from("/proj/evaluation")),
+            ("migrations".to_string(), PathBuf::from("/proj/migrations")),
+        ]
+        .into_iter()
+        .collect();
+        let manifest = PathBuf::from("/proj/pyproject.toml");
+        assert_eq!(manifest_package_label(&manifest, &packages), "proj");
     }
 }

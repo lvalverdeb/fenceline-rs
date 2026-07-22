@@ -32,6 +32,27 @@ fn file_name_is(path: &Path, names: &[&str]) -> bool {
         .is_some_and(|n| names.contains(&n))
 }
 
+const LOCKFILE_NAMES: &[&str] = &["uv.lock", "poetry.lock", "Pipfile.lock"];
+
+/// True if a recognized lockfile sits alongside `manifest_path` -- mirrors
+/// `manifest_checks.py::_sibling_lockfile_exists`. When a project is
+/// locked, the manifest's own loose version ranges only matter at upgrade
+/// time (a deliberate, reviewable relock), not at every install/sync,
+/// which resolves from the lockfile rather than re-resolving the
+/// manifest's ranges.
+fn sibling_lockfile_exists(manifest_path: &Path) -> bool {
+    let Some(parent) = manifest_path.parent() else {
+        return false;
+    };
+    if LOCKFILE_NAMES.iter().any(|name| parent.join(name).exists()) {
+        return true;
+    }
+    // pip-compile: requirements.txt is itself the generated lockfile, so
+    // its presence only counts when *this* manifest isn't that same file.
+    manifest_path.file_name().and_then(|n| n.to_str()) != Some("requirements.txt")
+        && parent.join("requirements.txt").exists()
+}
+
 /// Scan pyproject.toml / requirements.txt / setup.py for known CVEs -- CWE-1104.
 pub fn check_dependency_cve(
     path: &Path,
@@ -128,6 +149,7 @@ pub fn check_unbounded_pins(
     if !file_name_is(path, MANIFEST_NAMES_PINS) {
         return vec![];
     }
+    let locked = sibling_lockfile_exists(path);
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let lineno = i + 1;
@@ -149,18 +171,25 @@ pub fn check_unbounded_pins(
         if MULTI_UPPER_BOUND_RE.is_match(stripped) {
             continue;
         }
+        let description = if locked {
+            format!(
+                "'{dep_name}>={version}' has no upper bound, but a lockfile alongside this manifest means installs resolve from the lockfile, not this range directly — the residual risk is at upgrade-time review (`lock --upgrade` or equivalent), not silent install-time drift. Still worth bounding for when that upgrade happens."
+            )
+        } else {
+            format!(
+                "'{dep_name}>={version}' has no upper bound — pip resolves to latest matching version. A compromised wheel at a higher version propagates silently. Use '{dep_name}>={version},<next_major' to bound."
+            )
+        };
         results.push(Finding {
             cwe_id: "CWE-1104",
             cwe_name: "Supply Chain — Unbounded Dependency Pin",
-            severity: Severity::Low,
+            severity: if locked { Severity::Info } else { Severity::Low },
             confidence: Confidence::default(),
             package: String::new(),
             file: pk.to_string(),
             line: lineno,
             code_snippet: stripped.to_string(),
-            description: format!(
-                "'{dep_name}>={version}' has no upper bound — pip resolves to latest matching version. A compromised wheel at a higher version propagates silently. Use '{dep_name}>={version},<next_major' to bound."
-            ),
+            description,
             zero_day_relevance: "CVE-2026-42208: litellm>=1.61.3 with no upper bound led to a .pth backdoor via transitive dep (semantic-router).",
         });
     }

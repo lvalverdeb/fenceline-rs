@@ -103,6 +103,33 @@ pub fn rel(path: &Path, workspace_root: Option<&Path>) -> String {
     path.display().to_string()
 }
 
+const TEST_DIR_NAMES: &[&str] = &["tests", "test"];
+
+/// True if `file_path` looks like test code by common pytest convention: a
+/// `tests`/`test` directory component, a `test_*.py`/`*_test.py` filename,
+/// or `conftest.py` -- mirrors `scanner.py::_is_test_path`.
+///
+/// Deliberately narrow to these well-established naming conventions —
+/// doesn't attempt to recognize codebase-specific "not quite production"
+/// directories (e.g. an app's own `evaluation/` benchmark harness), since a
+/// name like that means different things in different codebases and
+/// guessing wrong risks silently suppressing real production findings
+/// under a misleadingly broad match.
+pub fn is_test_path(file_path: &str) -> bool {
+    let normalized = file_path.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
+    let Some((name, dirs)) = parts.split_last() else {
+        return false;
+    };
+    if *name == "conftest.py" {
+        return true;
+    }
+    if name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py")) {
+        return true;
+    }
+    dirs.iter().any(|part| TEST_DIR_NAMES.contains(part))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +256,26 @@ mod tests {
     fn rel_returns_absolute_path_when_no_workspace_root() {
         let path = Path::new("/elsewhere/mod.py");
         assert_eq!(rel(path, None), "/elsewhere/mod.py");
+    }
+
+    #[test]
+    fn is_test_path_recognizes_pytest_conventions() {
+        assert!(is_test_path("tests/test_foo.py"));
+        assert!(is_test_path("pkg/tests/helpers.py"));
+        assert!(is_test_path("pkg/test_foo.py"));
+        assert!(is_test_path("pkg/foo_test.py"));
+        assert!(is_test_path("pkg/conftest.py"));
+        assert!(is_test_path("test/foo.py"));
+    }
+
+    #[test]
+    fn is_test_path_ignores_production_code() {
+        assert!(!is_test_path("pkg/mod.py"));
+        assert!(!is_test_path("pkg/attestation.py"));
+        assert!(!is_test_path("pkg/testing_utils.py"));
+        // "evaluation/" is deliberately NOT recognized -- see is_test_path's
+        // own doc comment for why a codebase-specific directory name isn't
+        // safe to hardcode as a universal "not production" signal.
+        assert!(!is_test_path("evaluation/load_test_identify.py"));
     }
 }

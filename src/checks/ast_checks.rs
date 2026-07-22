@@ -296,7 +296,8 @@ impl<'a> Visitor for Collector<'a> {
             matches!(node.type_.as_deref(), Some(Expr::Name(n)) if n.id.as_str() == "Exception");
         let single_pass = node.body.len() == 1 && matches!(node.body[0], Stmt::Pass(_));
         let single_continue = node.body.len() == 1 && matches!(node.body[0], Stmt::Continue(_));
-        let has_diagnostic = crate::ast_helpers::handler_has_diagnostic(&node.body);
+        let has_diagnostic =
+            crate::ast_helpers::handler_has_diagnostic(&node.body, node.name.as_deref());
         self.out.excepts.push(ExceptRec {
             line,
             is_bare,

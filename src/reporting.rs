@@ -41,6 +41,8 @@ struct ReportPayload<'a> {
     baseline_suppressed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nosec_suppressed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_suppressed: Option<usize>,
 }
 
 pub fn print_report(
@@ -48,6 +50,7 @@ pub fn print_report(
     json_output: bool,
     baseline_suppressed: usize,
     nosec_suppressed: usize,
+    test_suppressed: usize,
 ) {
     if json_output {
         let payload = ReportPayload {
@@ -69,6 +72,7 @@ pub fn print_report(
             count: all_findings.len(),
             baseline_suppressed: (baseline_suppressed > 0).then_some(baseline_suppressed),
             nosec_suppressed: (nosec_suppressed > 0).then_some(nosec_suppressed),
+            test_suppressed: (test_suppressed > 0).then_some(test_suppressed),
         };
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
         return;
@@ -82,6 +86,11 @@ pub fn print_report(
         }
         if nosec_suppressed > 0 {
             println!("  ({nosec_suppressed} finding(s) suppressed by # nosec)");
+        }
+        if test_suppressed > 0 {
+            println!(
+                "  ({test_suppressed} finding(s) in test code suppressed — see --include-tests)"
+            );
         }
         println!("  {}", "=".repeat(72));
         println!();
@@ -99,6 +108,9 @@ pub fn print_report(
     }
     if nosec_suppressed > 0 {
         println!("  ({nosec_suppressed} finding(s) suppressed by # nosec)");
+    }
+    if test_suppressed > 0 {
+        println!("  ({test_suppressed} finding(s) in test code suppressed — see --include-tests)");
     }
     println!("  {}\n", "=".repeat(72));
 
@@ -143,6 +155,13 @@ pub fn print_report(
         }
     }
     println!("  {}\n", "─".repeat(72));
+    if baseline_suppressed == 0 && nosec_suppressed == 0 {
+        println!(
+            "  Confirmed a finding is a false positive or accepted risk? Suppress it with \
+             `# nosec [CWE-ID]` on that line, or adopt fenceline on an existing codebase with \
+             `--write-baseline`/`--baseline` — see README.md.\n"
+        );
+    }
     println!("{CWE_REFERENCE}");
 }
 
@@ -293,10 +312,12 @@ mod tests {
             count: 0,
             baseline_suppressed: None,
             nosec_suppressed: None,
+            test_suppressed: None,
         };
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(!serialized.contains("baseline_suppressed"));
         assert!(!serialized.contains("nosec_suppressed"));
+        assert!(!serialized.contains("test_suppressed"));
     }
 
     #[test]
@@ -306,9 +327,11 @@ mod tests {
             count: 0,
             baseline_suppressed: Some(3),
             nosec_suppressed: Some(2),
+            test_suppressed: Some(1),
         };
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(serialized.contains("\"baseline_suppressed\":3"));
         assert!(serialized.contains("\"nosec_suppressed\":2"));
+        assert!(serialized.contains("\"test_suppressed\":1"));
     }
 }

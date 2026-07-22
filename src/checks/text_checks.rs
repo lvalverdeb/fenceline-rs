@@ -213,15 +213,64 @@ static SQL_INJECTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::
     ]
 });
 
+const SQL_EXEC_METHOD_NAMES: &[&str] = &["execute", "exec_driver_sql"];
+
+/// Line numbers of `.execute(f"...")`/`.exec_driver_sql(f"...")`-shaped
+/// calls (whichever of `method_names` apply) where every interpolated
+/// value resolves to a locally-safe origin -- mirrors
+/// `text_checks.py::_fully_safe_fstring_exec_lines`.
+///
+/// Real-world false-positive report: every one of 7 CRITICAL findings on
+/// an Alembic migration fired on an f-string whose only interpolated
+/// values were a module-level string constant and a value derived
+/// entirely from the database's own read-only introspection (e.g.
+/// `current_database()`) -- neither reachable from any request path.
+fn fully_safe_fstring_exec_lines(
+    lines: Lines,
+    tree: Option<&ModModule>,
+    method_names: &[&str],
+) -> std::collections::HashSet<usize> {
+    let mut safe_lines = std::collections::HashSet::new();
+    let Some(tree) = tree else {
+        return safe_lines;
+    };
+    let source = lines.join("\n");
+    let li = crate::ast_helpers::LineIndex::new(&source);
+    for scoped in crate::ast_helpers::iter_calls_in_scope(tree) {
+        let is_target = matches!(scoped.call.func.as_ref(), rustpython_ast::Expr::Attribute(a) if method_names.contains(&a.attr.as_str()));
+        if !is_target {
+            continue;
+        }
+        let Some(first_arg) = scoped.call.args.first() else {
+            continue;
+        };
+        if !matches!(first_arg, rustpython_ast::Expr::JoinedStr(_)) {
+            continue;
+        }
+        if crate::ast_helpers::is_locally_safe_expr(
+            first_arg,
+            &scoped.params,
+            &scoped.literals,
+            &scoped.imports,
+            0,
+        ) {
+            safe_lines.insert(li.line_number(rustpython_ast::Ranged::start(&scoped.call)));
+        }
+    }
+    safe_lines
+}
+
 pub fn check_sql_injection(
     _path: &Path,
     pk: &str,
     lines: Lines,
-    _tree: Option<&ModModule>,
+    tree: Option<&ModModule>,
 ) -> Vec<Finding> {
+    let safe_lines = fully_safe_fstring_exec_lines(lines, tree, SQL_EXEC_METHOD_NAMES);
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
+        let lineno = i + 1;
+        if skip(line) || safe_lines.contains(&lineno) {
             continue;
         }
         for (pat, desc) in SQL_INJECTION_PATTERNS.iter() {
@@ -232,7 +281,7 @@ pub fn check_sql_injection(
                     Severity::Critical,
                     Confidence::default(),
                     pk,
-                    i + 1,
+                    lineno,
                     line.trim(),
                     desc.to_string(),
                     "CWE-89 rose to #2 in 2025 Top 25. Most exploited injection class after XSS.",
@@ -394,16 +443,68 @@ static SSRF_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-pub fn check_ssrf(_path: &Path, pk: &str, lines: Lines, _tree: Option<&ModModule>) -> Vec<Finding> {
+const SSRF_METHOD_NAMES: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "request",
+];
+
+/// Line numbers of `requests.*`/`httpx.*`/`urllib.request.urlopen(...)`
+/// calls whose URL argument resolves to a locally-safe origin -- mirrors
+/// `text_checks.py::_fully_safe_ssrf_call_lines`.
+///
+/// SSRF is fundamentally about *attacker-influenced* destination
+/// selection -- a finding that fires whenever the syntactic pattern
+/// matches, regardless of whether any part of the URL is externally
+/// influenced, isn't measuring that.
+fn fully_safe_ssrf_call_lines(
+    lines: Lines,
+    tree: Option<&ModModule>,
+) -> std::collections::HashSet<usize> {
+    let mut safe_lines = std::collections::HashSet::new();
+    let Some(tree) = tree else {
+        return safe_lines;
+    };
+    let source = lines.join("\n");
+    let li = crate::ast_helpers::LineIndex::new(&source);
+    for scoped in crate::ast_helpers::iter_calls_in_scope(tree) {
+        let Some(first_arg) = scoped.call.args.first() else {
+            continue;
+        };
+        let is_requests_httpx = matches!(
+            scoped.call.func.as_ref(),
+            rustpython_ast::Expr::Attribute(a)
+                if SSRF_METHOD_NAMES.contains(&a.attr.as_str())
+                    && matches!(a.value.as_ref(), rustpython_ast::Expr::Name(n) if n.id.as_str() == "requests" || n.id.as_str() == "httpx")
+        );
+        let is_urlopen =
+            crate::ast_helpers::full_attr(scoped.call.func.as_ref()) == "urllib.request.urlopen";
+        if !(is_requests_httpx || is_urlopen) {
+            continue;
+        }
+        if crate::ast_helpers::is_locally_safe_expr(
+            first_arg,
+            &scoped.params,
+            &scoped.literals,
+            &scoped.imports,
+            0,
+        ) {
+            safe_lines.insert(li.line_number(rustpython_ast::Ranged::start(&scoped.call)));
+        }
+    }
+    safe_lines
+}
+
+pub fn check_ssrf(_path: &Path, pk: &str, lines: Lines, tree: Option<&ModModule>) -> Vec<Finding> {
+    let safe_lines = fully_safe_ssrf_call_lines(lines, tree);
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
+        let lineno = i + 1;
+        if skip(line) || safe_lines.contains(&lineno) {
             continue;
         }
         if SSRF_RE.is_match(line) {
             results.push(finding(
                 "CWE-918", "Server-Side Request Forgery", Severity::High, Confidence::default(),
-                pk, i + 1, line.trim(),
+                pk, lineno, line.trim(),
                 "HTTP request — verify URL is validated against allowlist; SSRF if user-controlled.".to_string(),
                 "CWE-918 fell to #22 but SSRF zero-days (cloud metadata exfiltration) remain critical.",
             ));
@@ -549,11 +650,13 @@ pub fn check_exec_driver_sql(
     _path: &Path,
     pk: &str,
     lines: Lines,
-    _tree: Option<&ModModule>,
+    tree: Option<&ModModule>,
 ) -> Vec<Finding> {
+    let safe_lines = fully_safe_fstring_exec_lines(lines, tree, &["exec_driver_sql"]);
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
+        let lineno = i + 1;
+        if skip(line) || safe_lines.contains(&lineno) {
             continue;
         }
         if EXEC_DRIVER_SQL_RE.is_match(line) {
@@ -563,7 +666,7 @@ pub fn check_exec_driver_sql(
                 Severity::Critical,
                 Confidence::default(),
                 pk,
-                i + 1,
+                lineno,
                 line.trim(),
                 "exec_driver_sql() with f-string — direct SQL injection.".to_string(),
                 "",
