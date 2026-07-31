@@ -166,16 +166,26 @@ pub struct Args {
     #[arg(long, short = 'q')]
     pub quiet: bool,
 
-    /// Add a scan target package as NAME=PATH (repeatable). Replaces the cwd
-    /// auto-discovered registry entirely when given, rather than adding to
-    /// it -- pass one --package per target to scan more than one.
+    /// TOML file with a 'packages' table of name = "path" entries, replacing
+    /// the cwd auto-discovered registry. Paths resolve relative to the
+    /// config file.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Add or override one package as NAME=PATH (repeatable). Applied on
+    /// top of --config; replaces the cwd auto-discovered registry entirely
+    /// when either is given, rather than adding to it.
     #[arg(long, value_name = "NAME=PATH")]
     pub package: Vec<String>,
 
     /// Names to scan from the resolved registry (default: all -- see
-    /// --package for how the registry is built)
+    /// --config/--package for how the registry is built)
     #[arg(long, value_name = "NAME", num_args = 0..)]
     pub packages: Option<Vec<String>>,
+
+    /// Extra path substrings to exclude from scanning (default: none)
+    #[arg(long, value_name = "SUBSTR", num_args = 0..)]
+    pub exclude: Vec<String>,
 
     /// Exit 1 only when findings at or above this severity exist
     #[arg(long, value_enum, default_value = "high")]
@@ -248,6 +258,98 @@ fn parse_package_args(
     Ok(resolved)
 }
 
+/// Loads a `{name: path}` package registry from a TOML config file --
+/// mirrors `cli.py::_load_packages_from_config`. TOML rather than YAML:
+/// fenceline's own dependency list is intentionally empty (its README lists
+/// the PyYAML shadow vulnerability as one of the exploit patterns it scans
+/// for), and the `toml` crate is already a dependency here (used for
+/// workspace-root discovery in `config.rs`), so this adds no new dependency.
+///
+/// Every resolved path is validated with `is_secure_path`, same as
+/// `parse_package_args` -- a config-supplied path is just as capable of
+/// pointing outside the allowed roots as a CLI one. The config file's own
+/// directory is added to the allowed roots alongside the workspace root and
+/// cwd, since the caller explicitly pointed `--config` at it.
+fn load_packages_from_config(
+    config_path: &Path,
+    cwd: &Path,
+    workspace_root: Option<&Path>,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let text = std::fs::read_to_string(config_path).map_err(|e| {
+        format!(
+            "error: could not read --config {}: {e}",
+            config_path.display()
+        )
+    })?;
+    let value: toml::Table = text.parse().map_err(|e| {
+        format!(
+            "error: could not parse --config {}: {e}",
+            config_path.display()
+        )
+    })?;
+
+    let packages = value
+        .get("packages")
+        .and_then(|p| p.as_table())
+        .ok_or_else(|| {
+            format!(
+                "error: {} must define a top-level 'packages' table of name = \"path\" entries",
+                config_path.display()
+            )
+        })?;
+
+    let base_dir = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let allowed_roots: Vec<&Path> = [workspace_root, Some(cwd), Some(base_dir.as_path())]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut resolved = BTreeMap::new();
+    for (name, entry) in packages {
+        let rel_path = entry.as_str().unwrap_or_default();
+        let joined = base_dir.join(rel_path);
+        let candidate = joined.canonicalize().map_err(|_| {
+            format!(
+                "error: --config package {name:?}={rel_path:?} resolves to {}, which does not exist.",
+                joined.display()
+            )
+        })?;
+        if !is_secure_path(&candidate, &allowed_roots) {
+            return Err(format!(
+                "error: --config package {name:?}={rel_path:?} resolves to {}, which is outside the allowed roots {:?}.",
+                candidate.display(),
+                allowed_roots
+            ));
+        }
+        resolved.insert(name.clone(), candidate);
+    }
+    Ok(resolved)
+}
+
+/// Builds the effective `{name: path}` package registry for one run,
+/// combining `--config` and `--package` the same way spaghetti-rs's own
+/// `resolve_packages` does: config first, then `--package` entries overlaid
+/// on top (adding new names or overriding ones already defined).
+fn resolve_packages(
+    config_path: Option<&Path>,
+    package_args: &[String],
+    cwd: &Path,
+    workspace_root: Option<&Path>,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut packages = match config_path {
+        Some(path) => load_packages_from_config(path, cwd, workspace_root)?,
+        None => BTreeMap::new(),
+    };
+    packages.extend(parse_package_args(package_args, cwd, workspace_root)?);
+    Ok(packages)
+}
+
 /// Finds dependency manifest files for a package by walking upward from
 /// `root` to `ceiling`, stopping at the first ancestor where any manifest
 /// file exists -- mirrors `cli.py::_find_manifest_files`.
@@ -304,21 +406,32 @@ pub fn run(args: &Args) -> i32 {
     let cwd = std::env::current_dir().expect("cwd must be readable");
     let workspace_root = find_workspace_root(&cwd);
 
-    // A bare invocation (no --package) must never silently fall back to a
-    // hardcoded workspace-specific registry -- instead it auto-discovers
-    // whatever's actually under the current directory. --package opts back
-    // into an explicit, non-cwd-derived registry.
+    // A bare invocation (no --config/--package) must never silently fall
+    // back to a hardcoded workspace-specific registry -- instead it
+    // auto-discovers whatever's actually under the current directory.
+    // --config/--package (in any combination) opt back into an explicit,
+    // non-cwd-derived registry.
     let mut non_recursive: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut exclude: &[&str] = &[];
-    let mut packages = if args.package.is_empty() {
+    let extra_exclude: Vec<&str> = args.exclude.iter().map(String::as_str).collect();
+    let mut exclude: Vec<&str> = extra_exclude.clone();
+    let mut packages = if args.config.is_none() && args.package.is_empty() {
         let (packages, loose_root_name) = discover_cwd_packages(&cwd);
-        exclude = DEFAULT_CWD_EXCLUDES;
+        exclude = extra_exclude
+            .iter()
+            .copied()
+            .chain(DEFAULT_CWD_EXCLUDES.iter().copied())
+            .collect();
         if let Some(name) = loose_root_name {
             non_recursive.insert(name);
         }
         packages
     } else {
-        match parse_package_args(&args.package, &cwd, workspace_root.as_deref()) {
+        match resolve_packages(
+            args.config.as_deref(),
+            &args.package,
+            &cwd,
+            workspace_root.as_deref(),
+        ) {
             Ok(packages) => packages,
             Err(message) => {
                 eprintln!("{message}");
@@ -358,7 +471,7 @@ pub fn run(args: &Args) -> i32 {
     let mut path_package: BTreeMap<PathBuf, String> = BTreeMap::new();
     for (name, root) in &packages {
         let recursive = !non_recursive.contains(name);
-        for path in iter_py(root, recursive, exclude) {
+        for path in iter_py(root, recursive, &exclude) {
             path_package.entry(path).or_insert_with(|| name.clone());
         }
         for path in find_manifest_files(root, workspace_root.as_deref()) {
@@ -559,6 +672,101 @@ mod tests {
         .collect();
         let manifest = PathBuf::from("/proj/evaluation/pyproject.toml");
         assert_eq!(manifest_package_label(&manifest, &packages), "evaluation");
+    }
+
+    #[test]
+    fn load_packages_from_config_resolves_relative_to_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conf_dir = tmp.path().join("conf");
+        std::fs::create_dir(&conf_dir).unwrap();
+        let pkg_dir = conf_dir.join("src").join("my_lib");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let config_path = conf_dir.join("fenceline.toml");
+        std::fs::write(&config_path, "[packages]\nmy-lib = \"src/my_lib\"\n").unwrap();
+
+        let packages = load_packages_from_config(&config_path, tmp.path(), None).unwrap();
+
+        assert_eq!(packages["my-lib"], pkg_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn load_packages_from_config_rejects_path_outside_allowed_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let conf_dir = tmp.path().join("conf");
+        std::fs::create_dir(&conf_dir).unwrap();
+        let config_path = conf_dir.join("fenceline.toml");
+        // An absolute path to a real, existing directory outside `tmp` --
+        // relative traversal (`../../../etc`) is too fragile here since how
+        // many `..` hops reach an existing ancestor varies by platform/CI
+        // tmpdir depth, and a nonexistent target fails at the "does not
+        // exist" check before ever reaching the security check under test.
+        std::fs::write(
+            &config_path,
+            format!(
+                "[packages]\nevil = {:?}\n",
+                outside.path().canonicalize().unwrap().display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let err = load_packages_from_config(&config_path, tmp.path(), None).unwrap_err();
+        assert!(err.contains("outside the allowed roots"), "{err}");
+    }
+
+    #[test]
+    fn load_packages_from_config_missing_packages_key_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("fenceline.toml");
+        std::fs::write(&config_path, "not_packages = {}\n").unwrap();
+
+        let err = load_packages_from_config(&config_path, tmp.path(), None).unwrap_err();
+        assert!(
+            err.contains("must define a top-level 'packages' table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn load_packages_from_config_missing_file_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err =
+            load_packages_from_config(&tmp.path().join("nope.toml"), tmp.path(), None).unwrap_err();
+        assert!(err.contains("could not read --config"), "{err}");
+    }
+
+    #[test]
+    fn resolve_packages_package_args_overlay_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src").join("configured")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src").join("override")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src").join("extra")).unwrap();
+        let config_path = tmp.path().join("fenceline.toml");
+        std::fs::write(
+            &config_path,
+            "[packages]\nconfigured = \"src/configured\"\n",
+        )
+        .unwrap();
+
+        let result = resolve_packages(
+            Some(&config_path),
+            &[
+                "extra=src/extra".to_string(),
+                "configured=src/override".to_string(),
+            ],
+            tmp.path(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["configured"],
+            tmp.path().join("src/override").canonicalize().unwrap()
+        );
+        assert_eq!(
+            result["extra"],
+            tmp.path().join("src/extra").canonicalize().unwrap()
+        );
     }
 
     #[test]
