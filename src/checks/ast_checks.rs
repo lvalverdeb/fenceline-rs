@@ -1006,7 +1006,13 @@ pub fn check_huggingface_unsafe_download(
         // dotted segment, or the whole thing if it wasn't a dotted attr
         // access) -- collected.calls only stores full_attr, so reconstruct.
         let name = c.full_attr.rsplit('.').next().unwrap_or(&c.full_attr);
-        if name != "from_pretrained" {
+        // trust_remote_code=True carries the same RCE risk on
+        // datasets.load_dataset()/transformers.pipeline() as it does on
+        // from_pretrained() -- not just from_pretrained -- so all three
+        // call names are checked for it. The unpinned-revision heuristic
+        // (CWE-1104) below stays scoped to from_pretrained only, the call
+        // name it was written against. Mirrors the Python fix.
+        if !matches!(name, "from_pretrained" | "load_dataset" | "pipeline") {
             continue;
         }
         let trust_remote_code = c
@@ -1026,7 +1032,7 @@ pub fn check_huggingface_unsafe_download(
                 description: "from_pretrained(trust_remote_code=True) executes arbitrary Python shipped in the model repo at load time — equivalent to running code from an untrusted third party.".to_string(),
                 zero_day_relevance: "Malicious HuggingFace repos with trust_remote_code payloads have been used for real supply-chain RCE against ML pipelines.",
             });
-        } else if !c.keyword_names.iter().any(|n| n == "revision") {
+        } else if name == "from_pretrained" && !c.keyword_names.iter().any(|n| n == "revision") {
             results.push(Finding {
                 cwe_id: "CWE-1104",
                 cwe_name: "Supply Chain — Unpinned Model Revision",

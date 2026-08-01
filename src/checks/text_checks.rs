@@ -9,7 +9,7 @@
 use crate::ast_helpers::{LOG_METHOD_CALL_ANY_RE, LOG_METHOD_CALL_RE, skip};
 use crate::models::{Confidence, Finding, Severity};
 use regex::{Regex, RegexBuilder};
-use rustpython_ast::ModModule;
+use rustpython_ast::{ModModule, StmtImport, StmtImportFrom, Visitor};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -332,22 +332,26 @@ pub fn check_path_traversal(
 }
 
 // ── check_hardcoded_secrets (CWE-798) ────────────────────────────────────
+//
+// Matched case-insensitively (`(?i)`) -- UPPER_SNAKE_CASE module constants
+// (`PASSWORD = "..."`) are the standard Python convention for exactly this
+// kind of value and were otherwise invisible. Mirrors the Python fix.
 
 static HARDCODED_SECRET_PATTERNS: LazyLock<Vec<(Regex, Severity, &'static str)>> =
     LazyLock::new(|| {
         vec![
             (
-                Regex::new(r#"(?:private_key|ssh_key|pem)\s*[:=]\s*["'][^"']+["']"#).unwrap(),
+                Regex::new(r#"(?i)(?:private_key|ssh_key|pem)\s*[:=]\s*["'][^"']+["']"#).unwrap(),
                 Severity::Critical,
                 "Hardcoded private key",
             ),
             (
-                Regex::new(r#"connection_url\s*=\s*["'][^"']*://[^"']+:[^"']+@"#).unwrap(),
+                Regex::new(r#"(?i)connection_url\s*=\s*["'][^"']*://[^"']+:[^"']+@"#).unwrap(),
                 Severity::Critical,
                 "Connection URL with embedded credentials",
             ),
             (
-                Regex::new(r#"(?:password|passwd|pwd)\s*[:=]\s*["'][^"']{4,}["']"#).unwrap(),
+                Regex::new(r#"(?i)(?:password|passwd|pwd)\s*[:=]\s*["'][^"']{4,}["']"#).unwrap(),
                 Severity::High,
                 "Hardcoded password",
             ),
@@ -383,6 +387,13 @@ pub fn check_hardcoded_secrets(
 
 static YAML_LOAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"yaml\.load\s*\(").unwrap());
 
+// `yaml.unsafe_load()` is PyYAML's own alias for
+// `yaml.load(x, Loader=yaml.UnsafeLoader)` -- same RCE, different call
+// name -- so it's matched directly rather than relying on YAML_LOAD_RE,
+// which never appears in that call at all. Mirrors the Python fix.
+static YAML_UNSAFE_LOAD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"yaml\.unsafe_load\s*\(").unwrap());
+
 pub fn check_yaml_deserialize(
     _path: &Path,
     pk: &str,
@@ -394,11 +405,13 @@ pub fn check_yaml_deserialize(
         if skip(line) {
             continue;
         }
-        if YAML_LOAD_RE.is_match(line) && !line.contains("SafeLoader") {
+        let loose_load = YAML_LOAD_RE.is_match(line) && !line.contains("SafeLoader");
+        let unsafe_load = YAML_UNSAFE_LOAD_RE.is_match(line);
+        if loose_load || unsafe_load {
             results.push(finding(
                 "CWE-502", "Deserialization of Untrusted Data", Severity::Critical, Confidence::default(),
                 pk, i + 1, line.trim(),
-                "yaml.load() without SafeLoader — enables arbitrary code execution.".to_string(),
+                "yaml.load()/yaml.unsafe_load() without SafeLoader — enables arbitrary code execution.".to_string(),
                 "CVE-2026-24009: Docling RCE via PyYAML shadow vulnerability. Transitive YAML deps can introduce RCE without a direct yaml import.",
             ));
         }
@@ -411,13 +424,60 @@ pub fn check_yaml_deserialize(
 static XXE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:xml\.etree|xml\.dom|xml\.sax)\.").unwrap());
 
-pub fn check_xxe(_path: &Path, pk: &str, lines: Lines, _tree: Option<&ModModule>) -> Vec<Finding> {
+#[derive(Default)]
+struct LxmlAliasFinder {
+    alias: Option<String>,
+}
+
+impl Visitor for LxmlAliasFinder {
+    fn visit_stmt_import_from(&mut self, node: StmtImportFrom) {
+        if node.module.as_deref() == Some("lxml") {
+            for a in &node.names {
+                if a.name.as_str() == "etree" {
+                    self.alias = Some(a.asname.as_deref().unwrap_or("etree").to_string());
+                }
+            }
+        }
+    }
+    fn visit_stmt_import(&mut self, node: StmtImport) {
+        for a in &node.names {
+            if a.name.as_str() == "lxml.etree" {
+                self.alias = Some(a.asname.as_deref().unwrap_or("lxml.etree").to_string());
+            }
+        }
+    }
+}
+
+/// Local name bound to `lxml.etree` -- `from lxml import etree` (optionally
+/// aliased) or `import lxml.etree` (optionally aliased) -- or `None` if not
+/// imported.
+///
+/// `lxml.etree` is the standard XML library alternative to the stdlib
+/// `xml.etree`/`xml.dom`/`xml.sax` modules XXE_RE already covers, and in
+/// production code is more common than any of them -- but it's almost
+/// always imported under a bare `etree` name, so XXE_RE's
+/// `xml.etree.`-style prefix match never fires on lxml usage (including the
+/// textbook OWASP XXE-enabling pattern, `etree.XMLParser(resolve_entities=True)`).
+/// Mirrors the Python fix.
+fn lxml_etree_alias(tree: &ModModule) -> Option<String> {
+    let mut finder = LxmlAliasFinder::default();
+    for stmt in tree.body.clone() {
+        finder.visit_stmt(stmt);
+    }
+    finder.alias
+}
+
+pub fn check_xxe(_path: &Path, pk: &str, lines: Lines, tree: Option<&ModModule>) -> Vec<Finding> {
+    let lxml_pattern = tree
+        .and_then(lxml_etree_alias)
+        .map(|alias| Regex::new(&format!(r"\b{}\.", regex::escape(&alias))).unwrap());
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if skip(line) {
             continue;
         }
-        if XXE_RE.is_match(line) {
+        let lxml_hit = lxml_pattern.as_ref().is_some_and(|p| p.is_match(line));
+        if XXE_RE.is_match(line) || lxml_hit {
             results.push(finding(
                 "CWE-611",
                 "XXE (XML External Entity)",
@@ -493,15 +553,90 @@ fn fully_safe_ssrf_call_lines(
     safe_lines
 }
 
+const SSRF_SESSION_CONSTRUCTORS: &[&str] =
+    &["requests.Session", "httpx.Client", "httpx.AsyncClient"];
+
+/// `(flagged_lines, safe_lines)` for `<var>.<http_method>(...)` calls whose
+/// `<var>` resolves, in its own function/module scope, to a
+/// `requests.Session()`/`httpx.Client()`/`httpx.AsyncClient()` binding
+/// (plain assignment or `with ... as`) -- the connection-reuse pattern
+/// SSRF_RE doesn't see, since the request is made on the bound variable
+/// rather than the module. Mirrors `text_checks.py::_ssrf_session_call_lines`.
+///
+/// Deliberately scoped per call via `iter_calls_in_scope` rather than a
+/// file-global name match: `session`/`client` are some of the most reused
+/// variable names in Python, and an unrelated same-named object in a
+/// *different* function scope -- a SQLAlchemy `session.get(Model, pk)`/
+/// `session.delete(obj)`, for instance -- is a realistic collision that a
+/// file-wide regex would wrongly flag as SSRF. Safe-line suppression reuses
+/// the same `is_locally_safe_expr` check already applied to direct
+/// `requests.get(...)`/`httpx.get(...)` calls, so a session-based call
+/// with a locally-safe literal URL isn't held to a stricter standard than
+/// the module-call form is.
+fn ssrf_session_call_lines(
+    lines: Lines,
+    tree: Option<&ModModule>,
+) -> (
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<usize>,
+) {
+    let mut flagged = std::collections::HashSet::new();
+    let mut safe = std::collections::HashSet::new();
+    let Some(tree) = tree else {
+        return (flagged, safe);
+    };
+    let source = lines.join("\n");
+    let li = crate::ast_helpers::LineIndex::new(&source);
+    for scoped in crate::ast_helpers::iter_calls_in_scope(tree) {
+        let rustpython_ast::Expr::Attribute(attr) = scoped.call.func.as_ref() else {
+            continue;
+        };
+        if !SSRF_METHOD_NAMES.contains(&attr.attr.as_str()) {
+            continue;
+        }
+        let rustpython_ast::Expr::Name(base) = attr.value.as_ref() else {
+            continue;
+        };
+        let Some(bound) = scoped.literals.get(base.id.as_str()) else {
+            continue;
+        };
+        let is_session_ctor = matches!(
+            bound,
+            rustpython_ast::Expr::Call(c)
+                if SSRF_SESSION_CONSTRUCTORS.contains(&crate::ast_helpers::full_attr(c.func.as_ref()).as_str())
+        );
+        if !is_session_ctor {
+            continue;
+        }
+        let line = li.line_number(rustpython_ast::Ranged::start(&scoped.call));
+        flagged.insert(line);
+        if let Some(first_arg) = scoped.call.args.first()
+            && crate::ast_helpers::is_locally_safe_expr(
+                first_arg,
+                &scoped.params,
+                &scoped.literals,
+                &scoped.imports,
+                0,
+            )
+        {
+            safe.insert(line);
+        }
+    }
+    (flagged, safe)
+}
+
 pub fn check_ssrf(_path: &Path, pk: &str, lines: Lines, tree: Option<&ModModule>) -> Vec<Finding> {
     let safe_lines = fully_safe_ssrf_call_lines(lines, tree);
+    let (session_flagged, session_safe) = ssrf_session_call_lines(lines, tree);
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let lineno = i + 1;
-        if skip(line) || safe_lines.contains(&lineno) {
+        if skip(line) {
             continue;
         }
-        if SSRF_RE.is_match(line) {
+        let module_hit = !safe_lines.contains(&lineno) && SSRF_RE.is_match(line);
+        let session_hit = session_flagged.contains(&lineno) && !session_safe.contains(&lineno);
+        if module_hit || session_hit {
             results.push(finding(
                 "CWE-918", "Server-Side Request Forgery", Severity::High, Confidence::default(),
                 pk, lineno, line.trim(),
@@ -1194,12 +1329,15 @@ pub fn check_zipslip(
 
 // ── check_hardcoded_tokens (CWE-798) ─────────────────────────────────────
 
+// Matched case-insensitively (`(?i)`) -- UPPER_SNAKE_CASE module constants
+// (`API_KEY = "..."`) are the standard Python convention for exactly this
+// kind of value and were otherwise invisible. Mirrors the Python fix.
 static HARDCODED_TOKEN_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
-        (Regex::new(r#"(?:api_key|apikey)\s*[:=]\s*["'][A-Za-z0-9_\-=]{16,}["']"#).unwrap(), "Hardcoded API key"),
-        (Regex::new(r#"(?:token|jwt)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+["']"#).unwrap(), "Hardcoded JWT token"),
-        (Regex::new(r#"(?:bearer|auth_token)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']"#).unwrap(), "Hardcoded bearer / auth token"),
-        (Regex::new(r#"(?:secret|client_secret)\s*[:=]\s*["'][A-Za-z0-9_\-+/=]{16,}["']"#).unwrap(), "Hardcoded secret"),
+        (Regex::new(r#"(?i)(?:api_key|apikey)\s*[:=]\s*["'][A-Za-z0-9_\-=]{16,}["']"#).unwrap(), "Hardcoded API key"),
+        (Regex::new(r#"(?i)(?:token|jwt)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+["']"#).unwrap(), "Hardcoded JWT token"),
+        (Regex::new(r#"(?i)(?:bearer|auth_token)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']"#).unwrap(), "Hardcoded bearer / auth token"),
+        (Regex::new(r#"(?i)(?:secret|client_secret)\s*[:=]\s*["'][A-Za-z0-9_\-+/=]{16,}["']"#).unwrap(), "Hardcoded secret"),
     ]
 });
 

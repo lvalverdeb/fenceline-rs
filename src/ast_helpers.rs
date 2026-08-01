@@ -8,8 +8,8 @@ use regex::Regex;
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
     Arguments, Comprehension, Expr, ExprCall, ExprLambda, Keyword, ModModule, Stmt, StmtAnnAssign,
-    StmtAssign, StmtAsyncFunctionDef, StmtClassDef, StmtFunctionDef, StmtImport, StmtImportFrom,
-    Visitor, WithItem,
+    StmtAssign, StmtAsyncFunctionDef, StmtAsyncWith, StmtClassDef, StmtFunctionDef, StmtImport,
+    StmtImportFrom, StmtWith, Visitor, WithItem,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -353,6 +353,35 @@ impl Visitor for ScopeNamesCollector {
             let bound = alias.asname.as_deref().unwrap_or(&alias.name);
             self.imports.insert(bound.to_string());
         }
+    }
+
+    // `with X() as y:` binds `y` to X()'s result for the remainder of the
+    // block, same as `y = X()` would -- treated identically here so a name
+    // bound via a context manager (e.g. `with httpx.AsyncClient() as
+    // client:`) resolves the same way a plain assignment does for callers
+    // that walk this scope's `literals`. Mirrors `ast_helpers._collect_scope_names`.
+    fn visit_stmt_with(&mut self, node: StmtWith) {
+        for item in &node.items {
+            if let Some(v) = &item.optional_vars
+                && let Expr::Name(n) = v.as_ref()
+            {
+                self.literals
+                    .insert(n.id.to_string(), item.context_expr.clone());
+            }
+        }
+        self.generic_visit_stmt_with(node);
+    }
+
+    fn visit_stmt_async_with(&mut self, node: StmtAsyncWith) {
+        for item in &node.items {
+            if let Some(v) = &item.optional_vars
+                && let Expr::Name(n) = v.as_ref()
+            {
+                self.literals
+                    .insert(n.id.to_string(), item.context_expr.clone());
+            }
+        }
+        self.generic_visit_stmt_async_with(node);
     }
 }
 
