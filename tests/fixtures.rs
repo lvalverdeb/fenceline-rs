@@ -5,8 +5,9 @@
 //! `confidence`/`line` -- the fields a port must reproduce exactly. Message
 //! text is not compared (allowed to differ, per RUST_PORT_PROPOSAL.md §5).
 
-use fenceline::checks::checks_by_name;
+use fenceline::checks::{LineView, checks};
 use fenceline::models::{Confidence, Finding, Severity};
+use fenceline::scanner::{mask_non_code, parse_source};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,7 +52,7 @@ fn fingerprint(f: &Finding) -> (String, Severity, Confidence, usize) {
 
 #[test]
 fn fixture_corpus_matches_expected_findings() {
-    let checks: HashMap<&str, _> = checks_by_name().into_iter().collect();
+    let checks: HashMap<&str, _> = checks().into_iter().map(|c| (c.fn_name, c)).collect();
     let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
     assert!(fixtures_dir.is_dir(), "fixtures/ directory must exist");
 
@@ -64,7 +65,7 @@ fn fixture_corpus_matches_expected_findings() {
             continue;
         }
         let check_name = check_dir.file_name().unwrap().to_str().unwrap().to_string();
-        let Some(&check_fn) = checks.get(check_name.as_str()) else {
+        let Some(check) = checks.get(check_name.as_str()) else {
             failures.push(format!(
                 "{check_name}: no matching Rust check function registered"
             ));
@@ -95,16 +96,18 @@ fn fixture_corpus_matches_expected_findings() {
 
             let lines: Vec<String> = source.lines().map(str::to_string).collect();
             let tree = if fake_path.extension().and_then(|e| e.to_str()) == Some("py") {
-                match rustpython_parser::parse(&source, rustpython_parser::Mode::Module, &path_name)
-                {
-                    Ok(rustpython_ast::Mod::Module(m)) => Some(m),
-                    _ => None,
-                }
+                parse_source(&source, fake_path)
             } else {
                 None
             };
+            // Same dispatch as cli.rs: regex checks see the comment/docstring-masked view.
+            let code_lines = mask_non_code(fake_path, &source, tree.as_ref());
+            let view = match check.view {
+                LineView::CodeOnly => &code_lines,
+                LineView::Raw => &lines,
+            };
 
-            let findings = check_fn(fake_path, &path_name, &lines, tree.as_ref());
+            let findings = (check.run)(fake_path, &path_name, view, tree.as_ref());
             let mut actual: Vec<_> = findings.iter().map(fingerprint).collect();
             actual.sort();
 

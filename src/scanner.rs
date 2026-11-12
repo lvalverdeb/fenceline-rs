@@ -1,6 +1,8 @@
 //! File discovery and reading, used before dispatching to checks -- mirrors
 //! `fenceline/scanner.py`.
 
+use rustpython_ast::{Constant, Expr, ModModule, Ranged, StmtExpr, Visitor};
+use rustpython_parser::{Mode, Tok, lexer::lex};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -68,28 +70,99 @@ pub fn iter_py(root: &Path, recursive: bool, exclude: &[&str]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Mirrors `scanner.py::_read`: never raises on a malformed/unreadable file
-/// -- returns an empty line list instead, same as Python's broad
-/// `except Exception: return []`.
-pub fn read_lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|text| text.lines().map(str::to_string).collect())
-        .unwrap_or_default()
+/// The file's text, or empty when unreadable or not valid UTF-8 -- mirrors
+/// `scanner.py::_read`'s broad `except Exception: return []` (an empty source
+/// yields no lines and no AST, so every check sees nothing).
+pub fn read_source(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Mirrors `scanner.py::_ast_parse`. Returns `None` on any read or parse
-/// failure -- syntax error, unreadable file, or malformed UTF-8 -- matching
-/// the fixed version of the Python function (its own `read_text()` call
-/// originally caught only `SyntaxError`, which meant a malformed-UTF-8 `.py`
-/// file crashed the whole scan rather than being skipped; fixed in the
-/// Python source alongside this port, see the fenceline history).
-pub fn ast_parse(path: &Path) -> Option<rustpython_ast::ModModule> {
-    let source = std::fs::read_to_string(path).ok()?;
+pub fn split_lines(source: &str) -> Vec<String> {
+    source.lines().map(str::to_string).collect()
+}
+
+/// Mirrors `scanner.py::_ast_parse`: `None` on any parse failure.
+pub fn parse_source(source: &str, path: &Path) -> Option<ModModule> {
     let path_str = path.to_string_lossy();
-    match rustpython_parser::parse(&source, rustpython_parser::Mode::Module, &path_str) {
+    match rustpython_parser::parse(source, Mode::Module, &path_str) {
         Ok(rustpython_ast::Mod::Module(module)) => Some(module),
         _ => None,
     }
+}
+
+/// `read_source` + `parse_source` for one path.
+pub fn ast_parse(path: &Path) -> Option<ModModule> {
+    parse_source(&std::fs::read_to_string(path).ok()?, path)
+}
+
+/// Byte ranges of every string-only statement (docstrings and bare `"..."`
+/// statements used as block comments), anywhere in the tree.
+struct StringStmtCollector {
+    ranges: Vec<(usize, usize)>,
+}
+
+impl Visitor for StringStmtCollector {
+    fn visit_stmt_expr(&mut self, node: StmtExpr) {
+        if let Expr::Constant(c) = node.value.as_ref()
+            && matches!(c.value, Constant::Str(_))
+        {
+            let r = c.range();
+            self.ranges.push((r.start().to_usize(), r.end().to_usize()));
+        }
+        self.generic_visit_stmt_expr(node);
+    }
+}
+
+/// Mirrors `scanner.py::mask_non_code`: the file's lines with every comment
+/// and every string-only statement blanked to spaces, so line numbers and
+/// columns are preserved exactly. This is the view the line-regex checks
+/// scan -- a regex can't tell `os.system(` in code from `os.system(` quoted
+/// in a docstring or noted in a trailing comment.
+///
+/// Non-`.py` files (dependency manifests) are returned unchanged. Comments
+/// come from the lexer and are taken as far as it gets on a file it can't
+/// fully tokenize; string statements come from `tree` and so are only
+/// masked when the file parsed. Trojan Source deliberately keeps scanning
+/// the raw lines (see `checks::LineView`).
+pub fn mask_non_code(path: &Path, source: &str, tree: Option<&ModModule>) -> Vec<String> {
+    if !path.extension().is_some_and(|e| e == "py") {
+        return split_lines(source);
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if let Some(tree) = tree {
+        let mut collector = StringStmtCollector { ranges: Vec::new() };
+        for stmt in &tree.body {
+            collector.visit_stmt(stmt.clone());
+        }
+        ranges.extend(collector.ranges);
+    }
+    for item in lex(source, Mode::Module) {
+        match item {
+            Ok((Tok::Comment(_), range)) => {
+                ranges.push((range.start().to_usize(), range.end().to_usize()));
+            }
+            Ok(_) => {}
+            Err(_) => break, // keep whatever was collected before the lexer gave up
+        }
+    }
+    if ranges.is_empty() {
+        return split_lines(source);
+    }
+    ranges.sort_unstable();
+    let mut masked = String::with_capacity(source.len());
+    let mut idx = 0usize;
+    for (pos, ch) in source.char_indices() {
+        while idx < ranges.len() && ranges[idx].1 <= pos {
+            idx += 1;
+        }
+        let in_range = idx < ranges.len() && ranges[idx].0 <= pos;
+        masked.push(if in_range && ch != '\n' && ch != '\r' {
+            ' '
+        } else {
+            ch
+        });
+    }
+    split_lines(&masked)
 }
 
 /// Workspace-relative path when possible, absolute otherwise -- mirrors
@@ -239,6 +312,62 @@ mod tests {
         let good_file = tmp.path().join("good.py");
         std::fs::write(&good_file, "x = 1\n").unwrap();
         assert!(ast_parse(&good_file).is_some());
+    }
+
+    fn mask(src: &str) -> Vec<String> {
+        let tree = parse_source(src, Path::new("x.py"));
+        mask_non_code(Path::new("x.py"), src, tree.as_ref())
+    }
+
+    #[test]
+    fn mask_blanks_trailing_comment_but_keeps_code_columns() {
+        let (code, comment) = ("x = os.system(\"ls\")", "  # os.popen( here is prose");
+        let out = mask(&format!("{code}{comment}\n"));
+        assert_eq!(out, vec![format!("{code}{}", " ".repeat(comment.len()))]);
+    }
+
+    #[test]
+    fn mask_blanks_multiline_docstring_and_bare_string_statements() {
+        let src = "def f():\n    \"\"\"Example:\n        os.system('rm -rf /')\n    \"\"\"\n    'block comment with pickle.loads('\n    return eval(x)\n";
+        let out = mask(src);
+        assert!(out[1..5].iter().all(|l| l.trim().is_empty()), "{out:?}");
+        assert_eq!(out[5], "    return eval(x)");
+        let orig: Vec<usize> = src.lines().map(|l| l.chars().count()).collect();
+        let masked: Vec<usize> = out.iter().map(|l| l.chars().count()).collect();
+        assert_eq!(orig, masked);
+    }
+
+    #[test]
+    fn mask_handles_non_ascii_before_a_docstring_end() {
+        let (doc, code, comment) = ("\"\"\"héllo wörld\"\"\"", "; y = 1", "  # tail");
+        let out = mask(&format!("class C:\n    {doc}{code}{comment}\n"));
+        assert_eq!(
+            out[1],
+            format!(
+                "    {}{code}{}",
+                " ".repeat(doc.chars().count()),
+                " ".repeat(comment.len())
+            )
+        );
+    }
+
+    #[test]
+    fn mask_still_blanks_comments_when_file_does_not_parse() {
+        let src = "def f(:\n    pass  # subprocess.run(\n";
+        let out = mask_non_code(Path::new("x.py"), src, None);
+        assert_eq!(
+            out[1],
+            format!("    pass{}", " ".repeat("  # subprocess.run(".len()))
+        );
+    }
+
+    #[test]
+    fn mask_leaves_non_python_files_untouched() {
+        let src = "requests==2.0.0  # pinned\n";
+        assert_eq!(
+            mask_non_code(Path::new("requirements.txt"), src, None),
+            vec![src.trim_end()]
+        );
     }
 
     #[test]

@@ -2,11 +2,14 @@
 //! `fenceline/cli.py`.
 
 use crate::baseline::{load_baseline, split_by_baseline, write_baseline};
+use crate::checks::LineView;
 use crate::checks::checks;
 use crate::config::{DEP_MANIFEST_FILES, find_workspace_root, is_secure_path};
 use crate::models::{Confidence, Finding, Severity};
 use crate::reporting::print_report;
-use crate::scanner::{ast_parse, is_test_path, iter_py, read_lines, rel};
+use crate::scanner::{
+    is_test_path, iter_py, mask_non_code, parse_source, read_source, rel, split_lines,
+};
 use crate::suppression::apply_suppressions;
 use clap::{Parser, ValueEnum};
 use std::collections::BTreeMap;
@@ -501,17 +504,23 @@ pub fn run(args: &Args) -> i32 {
     let mut nosec_suppressed = 0usize;
 
     for (path, pkg_name) in &path_package {
-        let lines = read_lines(path);
+        let source = read_source(path);
+        let lines = split_lines(&source);
         let tree = if path.extension().is_some_and(|e| e == "py") {
-            ast_parse(path)
+            parse_source(&source, path)
         } else {
             None
         };
+        let code_lines = mask_non_code(path, &source, tree.as_ref());
         let pk = rel(path, workspace_root.as_deref());
 
         let mut file_findings = Vec::new();
-        for (_, check_fn) in &all_checks {
-            for mut f in check_fn(path, &pk, &lines, tree.as_ref()) {
+        for check in &all_checks {
+            let view = match check.view {
+                LineView::CodeOnly => &code_lines,
+                LineView::Raw => &lines,
+            };
+            for mut f in (check.run)(path, &pk, view, tree.as_ref()) {
                 f.package = pkg_name.clone();
                 file_findings.push(f);
             }
