@@ -12,6 +12,7 @@ use rustpython_ast::{
     StmtImportFrom, StmtWith, Visitor, WithItem,
 };
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::LazyLock;
 
 pub struct LineIndex {
@@ -400,9 +401,13 @@ fn param_names_from_arguments(args: &Arguments) -> HashSet<String> {
 /// resolve names against.
 pub struct ScopedCall {
     pub call: ExprCall,
-    pub params: HashSet<String>,
-    pub literals: HashMap<String, Expr>,
-    pub imports: HashSet<String>,
+    /// Shared across every call in the same scope (`Rc`, not a per-call
+    /// clone): a file with N calls and M module-level literals would
+    /// otherwise cost O(N*M) string clones -- quadratic in practice, since
+    /// both grow with file length. Callers only read these.
+    pub params: Rc<HashSet<String>>,
+    pub literals: Rc<HashMap<String, Expr>>,
+    pub imports: Rc<HashSet<String>>,
 }
 
 struct FunctionScopeCollector {
@@ -502,13 +507,16 @@ pub fn iter_calls_in_scope(tree: &ModModule) -> Vec<ScopedCall> {
         literals.extend(own_literals);
         let mut imports = module_imports.clone();
         imports.extend(own_imports);
+        let params = Rc::new(params);
+        let literals = Rc::new(literals);
+        let imports = Rc::new(imports);
 
         for call in calls_in_stmts(&stmts) {
             result.push(ScopedCall {
                 call,
-                params: params.clone(),
-                literals: literals.clone(),
-                imports: imports.clone(),
+                params: Rc::clone(&params),
+                literals: Rc::clone(&literals),
+                imports: Rc::clone(&imports),
             });
         }
     }
