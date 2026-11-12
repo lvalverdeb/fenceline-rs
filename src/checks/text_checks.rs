@@ -152,6 +152,25 @@ const COMMAND_CALLS: &[(&str, Severity)] = &[
     ("asyncio.create_subprocess_shell", Severity::High),
 ];
 
+/// One compiled `\bNAME\s*\(` pattern per entry in `COMMAND_CALLS`, built
+/// once. Compiling these inside the per-line loop cost ~15-25us x 14 per
+/// line -- on a 60k-line file that alone was ~15s, four times Python's whole
+/// run (Python's `re` caches compiled patterns, so its identical-looking
+/// loop is cheap).
+static COMMAND_CALL_PATTERNS: LazyLock<Vec<(Regex, &'static str, Severity)>> =
+    LazyLock::new(|| {
+        COMMAND_CALLS
+            .iter()
+            .map(|(call, sev)| {
+                (
+                    Regex::new(&format!(r"\b{}\s*\(", regex::escape(call))).unwrap(),
+                    *call,
+                    *sev,
+                )
+            })
+            .collect()
+    });
+
 static SHELL_TRUE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"shell\s*=\s*True").unwrap());
 
 pub fn check_command_injection(
@@ -165,9 +184,8 @@ pub fn check_command_injection(
         if skip(line) {
             continue;
         }
-        for (call, sev) in COMMAND_CALLS {
-            let pat = format!(r"\b{}\s*\(", regex::escape(call));
-            if Regex::new(&pat).unwrap().is_match(line) {
+        for (re, call, sev) in COMMAND_CALL_PATTERNS.iter() {
+            if re.is_match(line) {
                 results.push(finding(
                     "CWE-78", "OS Command Injection", *sev, Confidence::default(),
                     pk, i + 1, line.trim(),
