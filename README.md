@@ -10,7 +10,7 @@ The [Python original](https://github.com/lvalverdeb/fenceline) remains the activ
 
 ## Why It Exists
 
-See the Python original's own README and `RUST_PORT_PROPOSAL.md` for the full rationale — in short: a native binary removes the Python-interpreter dependency for running the scanner anywhere (CI images, pre-commit hooks, external codebases), and fenceline's checks are simple enough (single-file, single-pass — no cross-file analysis) that a port carries much less risk than a typical static-analysis tool would.
+See the Python original's own README and `RUST_PORT_PROPOSAL.md` for the full rationale — in short: a native binary removes the Python-interpreter dependency for running the scanner anywhere (CI images, pre-commit hooks, external codebases), and fenceline's analysis is small enough (a per-function taint model plus one package-wide pass that binds call arguments to parameters, no general interprocedural solver) that a port carries much less risk than a typical static-analysis tool would.
 
 ## Install
 
@@ -117,7 +117,7 @@ fenceline --baseline fenceline-baseline.json          # only new findings fail C
 
 The Python repository's `benchmark/` directory holds a labelled comparison
 against Bandit and Semgrep on three intentionally vulnerable apps; this port
-produces the identical 139 findings there, so its numbers are the same. Run
+produces the identical 219 findings there, so its numbers are the same. Run
 it against the binary with
 `FENCELINE_CMD=target/release/fenceline ../fenceline/benchmark/run.sh`.
 
