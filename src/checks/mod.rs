@@ -112,11 +112,11 @@ pub fn checks() -> Vec<Check> {
         check!("LDAP Injection (CWE-90)", check_ldap, CodeOnly),
         check!("Weak Hash (CWE-328)", check_weak_hash, Raw),
         check!("Open Redirect (CWE-601)", check_open_redirect, Raw),
-        check!("Log Injection (CWE-117)", check_log_injection, CodeOnly),
+        check!("Log Injection (CWE-117)", check_log_injection, Raw),
         check!("Format String (CWE-134)", check_format_string, Raw),
         check!("Arbitrary File Write (CWE-73)", check_arbitrary_write, Raw),
         check!("Insecure Default (CWE-453)", check_insecure_default, Raw),
-        check!("Log Secrets (CWE-532)", check_log_secrets, CodeOnly),
+        check!("Log Secrets (CWE-532)", check_log_secrets, Raw),
         check!("Disabled TLS Verify (CWE-295)", check_tls_verify, Raw),
         check!("ZipSlip / TarSlip (CWE-22)", check_zipslip, Raw),
         check!(
@@ -149,7 +149,7 @@ pub fn checks() -> Vec<Check> {
         check!(
             "numpy.load library injection (CWE-114)",
             check_numpy_load_lib,
-            CodeOnly
+            Raw
         ),
         check!("pandas.read_xml XXE (CWE-611)", check_pandas_xml_xxe, Raw),
         check!(

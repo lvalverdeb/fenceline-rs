@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`fenceline`](https://github.com/lval
 
 The [Python original](https://github.com/lvalverdeb/fenceline) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/fenceline/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk uncovered and matched along the way (some quite subtle — e.g. `check_assert_security`'s `\b(is|==|!=|in)\b` provably never matching `==`/`!=` written the normal way with spaces or quotes around them).
 
-**Status**: all 57 checks ported (37 AST-based, 18 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 62 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
+**Status**: all 57 checks ported (40 AST-based, 15 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 62 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
 
 ## Why It Exists
 

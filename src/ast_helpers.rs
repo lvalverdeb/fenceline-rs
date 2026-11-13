@@ -4,7 +4,6 @@
 //! rustpython-ast tracks byte offsets (`TextSize`/`TextRange`) rather than
 //! Python's native `lineno`, so `LineIndex` bridges the two.
 
-use regex::Regex;
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
     Arguments, Comprehension, Expr, ExprCall, ExprLambda, Keyword, ModModule, Operator, Stmt,
@@ -13,7 +12,6 @@ use rustpython_ast::{
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::LazyLock;
 
 pub struct LineIndex {
     line_starts: Vec<u32>,
@@ -54,20 +52,6 @@ pub const LOGGING_METHOD_NAMES: &[&str] = &[
 ];
 
 const LOG_NAME_TOKENS: &[&str] = &["log", "logs", "logger", "logging"];
-
-/// Matches a logging call whose argument is an f-string, e.g.
-/// `logger.error(f"...")` -- mirrors `_LOG_METHOD_CALL_RE`.
-pub static LOG_METHOD_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    let alt = LOGGING_METHOD_NAMES.join("|");
-    Regex::new(&format!(r#"\.(?:{alt})\s*\(\s*f["']"#)).unwrap()
-});
-
-/// Same method-name set, without the f-string requirement -- mirrors
-/// `_LOG_METHOD_CALL_ANY_RE`.
-pub static LOG_METHOD_CALL_ANY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    let alt = LOGGING_METHOD_NAMES.join("|");
-    Regex::new(&format!(r"\.(?:{alt})\s*\(")).unwrap()
-});
 
 pub fn call_name(node: &ExprCall) -> String {
     match node.func.as_ref() {

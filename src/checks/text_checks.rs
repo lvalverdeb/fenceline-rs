@@ -7,7 +7,7 @@
 //! filtered via `skip()`).
 
 use crate::analysis::ParsedFile;
-use crate::ast_helpers::{LOG_METHOD_CALL_ANY_RE, LOG_METHOD_CALL_RE, skip};
+use crate::ast_helpers::skip;
 use crate::models::{Confidence, Finding, Severity};
 use regex::{Regex, RegexBuilder};
 use rustpython_ast::{ModModule, StmtImport, StmtImportFrom, Visitor};
@@ -433,66 +433,7 @@ pub fn check_ldap(
 
 // ── check_log_injection (CWE-117) ────────────────────────────────────────
 
-static LOG_FORMAT_SPECIFIER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"%[srd]|\{!r\}|\{!s\}").unwrap());
-
-pub fn check_log_injection(
-    _path: &Path,
-    pk: &str,
-    lines: Lines,
-    _tree: Option<&ParsedFile>,
-) -> Vec<Finding> {
-    let mut results = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
-        }
-        if LOG_METHOD_CALL_RE.is_match(line) && !LOG_FORMAT_SPECIFIER_RE.is_match(line) {
-            results.push(finding(
-                "CWE-117", "Log Injection / Forging", Severity::Low, Confidence::default(),
-                pk, i + 1, line.trim(),
-                "f-string in logger call — may embed newlines/CRLF from user input, forging log entries.".to_string(),
-                "",
-            ));
-        }
-    }
-    results
-}
-
 // ── check_log_secrets (CWE-532) ──────────────────────────────────────────
-
-static SECRET_KEYWORDS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    RegexBuilder::new(
-        r"(password|passwd|secret|token|api_key|apikey|auth_token|access_key|private_key)",
-    )
-    .case_insensitive(true)
-    .build()
-    .unwrap()
-});
-
-pub fn check_log_secrets(
-    _path: &Path,
-    pk: &str,
-    lines: Lines,
-    _tree: Option<&ParsedFile>,
-) -> Vec<Finding> {
-    let mut results = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
-        }
-        let stripped = line.trim();
-        if LOG_METHOD_CALL_ANY_RE.is_match(stripped) && SECRET_KEYWORDS_RE.is_match(stripped) {
-            results.push(finding(
-                "CWE-532", "Insertion of Sensitive Information into Logs", Severity::High, Confidence::default(),
-                pk, i + 1, stripped,
-                "Logger call includes a variable whose name suggests it holds a secret — potential credential leakage in logs.".to_string(),
-                "CWE-532: leaked creds in logs are a common zero-day discovery vector (GitHub secret scanning, SIEM alerts).",
-            ));
-        }
-    }
-    results
-}
 
 // ── check_hardcoded_tokens (CWE-798) ─────────────────────────────────────
 
@@ -682,35 +623,6 @@ pub fn check_ssh_host_key(
 }
 
 // ── check_numpy_load_lib (CWE-114) ───────────────────────────────────────
-
-static NUMPY_LOAD_LIB_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"numpy\.(?:load|ctypeslib)\.").unwrap());
-static SHARED_LIB_EXT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\.(so|dll|dylib)").unwrap());
-
-pub fn check_numpy_load_lib(
-    _path: &Path,
-    pk: &str,
-    lines: Lines,
-    _tree: Option<&ParsedFile>,
-) -> Vec<Finding> {
-    let mut results = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
-        }
-        let stripped = line.trim();
-        if NUMPY_LOAD_LIB_RE.is_match(stripped) && SHARED_LIB_EXT_RE.is_match(stripped) {
-            results.push(finding(
-                "CWE-114", "Process Control (numpy library loading)", Severity::High, Confidence::default(),
-                pk, i + 1, stripped,
-                "numpy.load() loading a shared library (.so/.dll) — arbitrary code execution if path is user-controlled.".to_string(),
-                "Trail of Bits: numpy.load() on .so files enables arbitrary code execution during array deserialization.",
-            ));
-        }
-    }
-    results
-}
 
 // ── check_pth_startup_hooks (CWE-829) ────────────────────────────────────
 

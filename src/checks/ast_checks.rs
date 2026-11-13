@@ -5,7 +5,9 @@
 //! itself.
 
 use crate::analysis::ParsedFile;
-use crate::ast_helpers::{call_name, dotted_matches, full_attr, resolve_dotted, skip};
+use crate::ast_helpers::{
+    LOGGING_METHOD_NAMES, call_name, dotted_matches, full_attr, resolve_dotted, skip,
+};
 use crate::models::{Confidence, Finding, Severity};
 use crate::taint::{Taint, confidence_for};
 use regex::{Regex, RegexBuilder};
@@ -1719,6 +1721,131 @@ pub fn check_legacy_pycrypto(
                 *line,
                 "Imports the old PyCrypto package (unmaintained since 2013, several unpatched CVEs) — migrate to pycryptodome (`import Cryptodome` / `from Cryptodome import ...`), a maintained drop-in replacement.".to_string(),
                 "PyCrypto has no security fixes for over a decade; several known vulnerabilities (e.g. weak RNG seeding in old releases) remain unpatched.",
+            )
+        })
+        .collect()
+}
+
+// ── Logging and library-loading calls (converted from line regexes so a
+// call whose arguments continue on later lines is still matched) ──────────
+
+static SECRET_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    RegexBuilder::new(
+        r"password|passwd|secret|token|api_key|apikey|auth_token|access_key|private_key|credential",
+    )
+    .case_insensitive(true)
+    .build()
+    .unwrap()
+});
+static SHARED_LIB_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.(?:so|dll|dylib)\b").unwrap());
+
+/// `x.info(...)`/`x.debug(...)`/... on anything but the `warnings` module,
+/// whose `warn` goes to stderr, not a log (`_warnings=warnings`
+/// default-argument idiom included) -- mirrors `ast_checks._is_logging_call`.
+fn is_logging_call(c: &crate::analysis::CallRec) -> bool {
+    if c.func_is_bare_name || !LOGGING_METHOD_NAMES.contains(&c.call_name.as_str()) {
+        return false;
+    }
+    let root = c.full_attr.split('.').next().unwrap_or("");
+    root.trim_start_matches('_') != "warnings"
+}
+
+pub fn check_log_secrets(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut results = Vec::new();
+    for c in &tree.collected().calls {
+        if !is_logging_call(c) {
+            continue;
+        }
+        let (confidence, description) = if c.arg_names.iter().any(|n| SECRET_KEYWORD_RE.is_match(n))
+        {
+            (
+                Confidence::High,
+                "Logger call includes a variable whose name suggests it holds a secret — potential credential leakage in logs.",
+            )
+        } else if c.args_dynamic
+            && c.str_fragments
+                .iter()
+                .any(|s| SECRET_KEYWORD_RE.is_match(s))
+        {
+            (
+                Confidence::Medium,
+                "Logger message mentions a secret-like term — confirm the value itself is not written to the log.",
+            )
+        } else {
+            continue;
+        };
+        results.push(ast_finding(
+            "CWE-532",
+            "Insertion of Sensitive Information into Logs",
+            Severity::High,
+            confidence,
+            pk,
+            lines,
+            c.line,
+            description.to_string(),
+            "CWE-532: leaked creds in logs are a common zero-day discovery vector (GitHub secret scanning, SIEM alerts).",
+        ));
+    }
+    results
+}
+
+pub fn check_log_injection(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| is_logging_call(c) && c.positional_fstring)
+        .map(|c| {
+            ast_finding(
+                "CWE-117",
+                "Log Injection / Forging",
+                Severity::Low,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "f-string in logger call — may embed newlines/CRLF from user input, forging log entries.".to_string(),
+                "",
+            )
+        })
+        .collect()
+}
+
+pub fn check_numpy_load_lib(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| c.full_attr == "numpy.load" || c.full_attr.starts_with("numpy.ctypeslib."))
+        .filter(|c| c.str_fragments.iter().any(|s| SHARED_LIB_RE.is_match(s)))
+        .map(|c| {
+            ast_finding(
+                "CWE-114",
+                "Process Control (numpy library loading)",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "numpy.load() loading a shared library (.so/.dll) — arbitrary code execution if path is user-controlled.".to_string(),
+                "Trail of Bits: numpy.load() on .so files enables arbitrary code execution during array deserialization.",
             )
         })
         .collect()

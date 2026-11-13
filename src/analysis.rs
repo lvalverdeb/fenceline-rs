@@ -198,6 +198,11 @@ pub struct CallRec {
     pub receiver_taint: Option<Taint>,
     /// `ast_helpers::sql_shape` of the first positional argument.
     pub first_arg_sql_shape: Option<&'static str>,
+    /// String literals passed directly as arguments plus the literal parts
+    /// of f-string arguments -- mirrors `ast_checks._string_fragments`.
+    pub str_fragments: Vec<String>,
+    /// A positional argument is an f-string with at least one interpolation.
+    pub positional_fstring: bool,
 }
 
 pub struct ExceptRec {
@@ -477,6 +482,33 @@ impl<'a> Visitor for Collector<'a> {
             _ => None,
         };
         let first_arg_sql_shape = node.args.first().and_then(sql_shape);
+        let mut str_fragments = Vec::new();
+        for a in node
+            .args
+            .iter()
+            .chain(node.keywords.iter().map(|kw| &kw.value))
+        {
+            match a {
+                Expr::Constant(c) => {
+                    if let Constant::Str(s) = &c.value {
+                        str_fragments.push(s.to_string());
+                    }
+                }
+                Expr::JoinedStr(j) => {
+                    for v in &j.values {
+                        if let Expr::Constant(c) = v
+                            && let Constant::Str(s) = &c.value
+                        {
+                            str_fragments.push(s.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let positional_fstring = node.args.iter().any(|a| {
+            matches!(a, Expr::JoinedStr(j) if j.values.iter().any(|v| matches!(v, Expr::FormattedValue(_))))
+        });
 
         self.out.calls.push(CallRec {
             line,
@@ -502,6 +534,8 @@ impl<'a> Visitor for Collector<'a> {
             first_arg_taint,
             receiver_taint,
             first_arg_sql_shape,
+            str_fragments,
+            positional_fstring,
         });
         self.generic_visit_expr_call(node);
     }
