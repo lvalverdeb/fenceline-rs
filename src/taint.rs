@@ -33,6 +33,7 @@ use rustpython_ast::{
     StmtAsyncFunctionDef, StmtAsyncWith, StmtAugAssign, StmtClassDef, StmtFor, StmtFunctionDef,
     StmtImport, StmtImportFrom, StmtWith, Visitor, WithItem,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -40,12 +41,19 @@ use std::rc::Rc;
 pub enum Taint {
     Clean,
     Internal,
+    /// A parameter that a caller elsewhere in the package feeds request
+    /// data (`crate::callers`); as reportable as `Source`, with its own note.
+    Caller,
     Source,
 }
 
 /// Appended to a finding's description when no source reaches the sink.
 pub const INTERNAL_NOTE: &str =
     " No request or environment input reaches this call within the enclosing function.";
+
+/// Appended when the source is a caller's argument, not this function's code.
+pub const CALLER_NOTE: &str =
+    " Request data reaches a parameter of this function from a caller in the package.";
 
 const REQUEST_ROOTS: &[&str] = &["request", "environ"];
 const SOURCE_PREFIXES: &[&str] = &["os.environ", "sys.argv", "sys.stdin", "self.request"];
@@ -305,6 +313,11 @@ pub struct ScopeInfo {
     handler: bool,
     assigns: HashMap<String, Vec<Expr>>,
     imports: HashSet<String>,
+    /// Name of the class whose body directly holds this function, if any.
+    cls: Option<String>,
+    /// Parameters some caller in the package feeds request data (set by
+    /// `crate::callers` after every file of the package is parsed).
+    caller_params: RefCell<HashSet<String>>,
 }
 
 /// Every `Name` inside an assignment target, like `ast.walk(target)` in the
@@ -478,8 +491,10 @@ fn param_names(args: &Arguments) -> HashSet<String> {
 }
 
 enum Frame {
-    Function(Rc<ScopeInfo>),
-    Class(Vec<String>),
+    /// A function and its qualified name (`Class.method`, `outer.inner`).
+    Function(Rc<ScopeInfo>, String),
+    /// A class: its name and its bases' dotted names.
+    Class(String, Vec<String>),
     /// A lambda, decorator, default argument or class base: no scope.
     Opaque,
 }
@@ -491,21 +506,31 @@ struct ScopeIndexer {
     module: Rc<ScopeInfo>,
     frames: Vec<Frame>,
     at: HashMap<TextSize, Option<Rc<ScopeInfo>>>,
+    functions: HashMap<String, Rc<ScopeInfo>>,
 }
 
 impl ScopeIndexer {
     fn current(&self) -> Option<Rc<ScopeInfo>> {
         match self.frames.last() {
             None => Some(Rc::clone(&self.module)),
-            Some(Frame::Function(s)) => Some(Rc::clone(s)),
-            Some(Frame::Class(_)) | Some(Frame::Opaque) => None,
+            Some(Frame::Function(s, _)) => Some(Rc::clone(s)),
+            Some(Frame::Class(..)) | Some(Frame::Opaque) => None,
         }
     }
 
-    fn enclosing_class_bases(&self) -> Option<&[String]> {
+    fn enclosing_class(&self) -> Option<(&str, &[String])> {
         match self.frames.last() {
-            Some(Frame::Class(bases)) => Some(bases),
+            Some(Frame::Class(name, bases)) => Some((name, bases)),
             _ => None,
+        }
+    }
+
+    /// `Class.` / `outer.` / "" -- what precedes a function's own name.
+    fn qualname_prefix(&self) -> String {
+        match self.frames.last() {
+            Some(Frame::Class(name, _)) => format!("{name}."),
+            Some(Frame::Function(_, qualname)) => format!("{qualname}."),
+            _ => String::new(),
         }
     }
 
@@ -516,7 +541,8 @@ impl ScopeIndexer {
         decorators: &[Expr],
         body: &[Stmt],
     ) -> Rc<ScopeInfo> {
-        let handler = is_handler(name, decorators, self.enclosing_class_bases());
+        let cls = self.enclosing_class();
+        let handler = is_handler(name, decorators, cls.map(|(_, bases)| bases));
         let own = collect_own(body);
         let mut assigns: HashMap<String, Vec<Expr>> = self
             .module
@@ -534,6 +560,8 @@ impl ScopeIndexer {
             handler,
             assigns,
             imports,
+            cls: cls.map(|(name, _)| name.to_string()),
+            caller_params: RefCell::new(HashSet::new()),
         })
     }
 
@@ -546,6 +574,8 @@ impl ScopeIndexer {
         returns: Option<Box<Expr>>,
     ) {
         let scope = self.function_scope(name, &args, &decorators, &body);
+        let qualname = format!("{}{name}", self.qualname_prefix());
+        self.functions.insert(qualname.clone(), Rc::clone(&scope));
         // Decorators, defaults and annotations belong to no scope.
         self.frames.push(Frame::Opaque);
         for deco in decorators {
@@ -556,7 +586,7 @@ impl ScopeIndexer {
             self.visit_expr(*returns);
         }
         self.frames.pop();
-        self.frames.push(Frame::Function(scope));
+        self.frames.push(Frame::Function(scope, qualname));
         for stmt in body {
             self.visit_stmt(stmt);
         }
@@ -589,7 +619,7 @@ impl Visitor for ScopeIndexer {
     }
     fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
         let bases: Vec<String> = node.bases.iter().map(expr_dotted_name).collect();
-        self.frames.push(Frame::Class(bases));
+        self.frames.push(Frame::Class(node.name.to_string(), bases));
         self.generic_visit_stmt_class_def(node);
         self.frames.pop();
     }
@@ -629,6 +659,7 @@ impl Visitor for ScopeIndexer {
 /// Per-file scope index: which `ScopeInfo` a sink node resolves names in.
 pub struct TaintIndex {
     at: HashMap<TextSize, Option<Rc<ScopeInfo>>>,
+    functions: HashMap<String, Rc<ScopeInfo>>,
 }
 
 impl TaintIndex {
@@ -639,16 +670,44 @@ impl TaintIndex {
             handler: false,
             assigns: own.assigns,
             imports: own.imports,
+            cls: None,
+            caller_params: RefCell::new(HashSet::new()),
         });
         let mut indexer = ScopeIndexer {
             module,
             frames: Vec::new(),
             at: HashMap::new(),
+            functions: HashMap::new(),
         };
         for stmt in tree.body.clone() {
             indexer.visit_stmt(stmt);
         }
-        TaintIndex { at: indexer.at }
+        TaintIndex {
+            at: indexer.at,
+            functions: indexer.functions,
+        }
+    }
+
+    /// Name of the class whose method directly contains the node at
+    /// `anchor`, if any -- mirrors `taint.enclosing_class`.
+    pub fn enclosing_class(&self, anchor: TextSize) -> Option<&str> {
+        match self.at.get(&anchor) {
+            Some(Some(scope)) => scope.cls.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Record that some caller feeds request data to `param` of the
+    /// function `qualname`; `true` when this is new information -- mirrors
+    /// `taint.mark_caller_param`.
+    pub fn mark_caller_param(&self, qualname: &str, param: &str) -> bool {
+        let Some(scope) = self.functions.get(qualname) else {
+            return false;
+        };
+        if !scope.params.contains(param) {
+            return false;
+        }
+        scope.caller_params.borrow_mut().insert(param.to_string())
     }
 
     /// Worst taint over `exprs`, resolved in the scope of the sink node
@@ -700,8 +759,11 @@ impl<'s> Classifier<'s> {
             return Taint::Source;
         }
         if self.scope.params.contains(name) {
-            return if self.scope.handler {
-                Taint::Source
+            if self.scope.handler {
+                return Taint::Source;
+            }
+            return if self.scope.caller_params.borrow().contains(name) {
+                Taint::Caller
             } else {
                 Taint::Internal
             };
@@ -823,6 +885,7 @@ impl<'s> Classifier<'s> {
 pub fn confidence_for(taint: Taint) -> Option<(Confidence, &'static str)> {
     match taint {
         Taint::Source => Some((Confidence::High, "")),
+        Taint::Caller => Some((Confidence::High, CALLER_NOTE)),
         Taint::Internal => Some((Confidence::Medium, INTERNAL_NOTE)),
         Taint::Clean => None,
     }

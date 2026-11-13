@@ -3,6 +3,7 @@
 
 use crate::analysis::ParsedFile;
 use crate::baseline::{load_baseline, split_by_baseline, write_baseline};
+use crate::callers::propagate;
 use crate::checks::LineView;
 use crate::checks::checks;
 use crate::config::{
@@ -526,15 +527,32 @@ pub fn run(args: &Args) -> i32 {
     // them off as clean.
     let mut skipped_files: Vec<String> = Vec::new();
 
-    for (path, pkg_name) in &path_package {
-        let source = read_source(path);
-        let lines = split_lines(&source);
-        let tree = if path.extension().is_some_and(|e| e == "py") {
-            ParsedFile::parse(&source, path)
-        } else {
-            None
-        };
-        let code_lines = mask_non_code(path, &source, tree.as_ref().map(|t| &t.module));
+    // Parse everything first: the cross-file pass needs every tree of a
+    // package before any check runs on one of its files.
+    let parsed: Vec<(&PathBuf, &String, String, Option<ParsedFile>)> = path_package
+        .iter()
+        .map(|(path, pkg_name)| {
+            let source = read_source(path);
+            let tree = if path.extension().is_some_and(|e| e == "py") {
+                ParsedFile::parse(&source, path)
+            } else {
+                None
+            };
+            (path, pkg_name, source, tree)
+        })
+        .collect();
+    for (name, root) in &packages {
+        let files: Vec<(&Path, &ParsedFile)> = parsed
+            .iter()
+            .filter(|(_, pkg, _, tree)| *pkg == name && tree.is_some())
+            .map(|(path, _, _, tree)| (path.as_path(), tree.as_ref().expect("filtered")))
+            .collect();
+        propagate(&files, root);
+    }
+
+    for (path, pkg_name, source, tree) in &parsed {
+        let lines = split_lines(source);
+        let code_lines = mask_non_code(path, source, tree.as_ref().map(|t| &t.module));
         let pk = rel(path, workspace_root.as_deref());
         if path.extension().is_some_and(|e| e == "py") && tree.is_none() {
             skipped_files.push(pk.clone());
@@ -548,7 +566,7 @@ pub fn run(args: &Args) -> i32 {
             };
             let cap = severity_policy.get(check.fn_name).copied();
             for mut f in (check.run)(path, &pk, view, tree.as_ref()) {
-                f.package = pkg_name.clone();
+                f.package = (*pkg_name).clone();
                 if let Some(cap) = cap {
                     f.severity = f.severity.capped(cap);
                 }
