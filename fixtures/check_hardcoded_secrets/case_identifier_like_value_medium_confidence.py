@@ -1,0 +1,2 @@
+SECRET_KEY = "AWSSecretKey"
+secret = "MYSUPERSECRETKEY"

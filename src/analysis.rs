@@ -14,10 +14,10 @@ use crate::ast_helpers::{
 use crate::taint::{Taint, TaintIndex};
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
-    Arguments, Comprehension, Constant, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprBinOp,
-    ExprCall, ExprCompare, ExprConstant, ExprJoinedStr, ExprName, Keyword, ModModule, Operator,
-    Ranged, Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef, StmtClassDef, StmtFunctionDef,
-    StmtImport, StmtImportFrom, Visitor, WithItem,
+    Arguments, CmpOp, Comprehension, Constant, ExceptHandlerExceptHandler, Expr, ExprAttribute,
+    ExprBinOp, ExprCall, ExprCompare, ExprConstant, ExprDict, ExprJoinedStr, ExprName, Keyword,
+    ModModule, Operator, Ranged, Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef,
+    StmtClassDef, StmtFunctionDef, StmtImport, StmtImportFrom, Visitor, WithItem,
 };
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
@@ -265,6 +265,13 @@ pub struct Collected {
     pub assigns: Vec<AssignRec>,
     pub ann_assigns: Vec<AssignRec>,
     pub pydantic_fields: Vec<PydanticFieldRec>,
+    /// `(line, name, value)` for every string literal bound to a name in any
+    /// binding shape (assignment, attribute, subscript key, dict entry,
+    /// keyword argument, comparison) -- mirrors `ast_checks._secret_bindings`.
+    pub secret_bindings: Vec<(usize, String, String)>,
+    /// `(line, text)` for every string literal of 16+ characters, for the
+    /// value-shaped credential check.
+    pub long_str_literals: Vec<(usize, String)>,
 }
 
 struct Collector<'a> {
@@ -376,9 +383,51 @@ fn params_from_arguments(
         .collect()
 }
 
+fn str_const(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Constant(c) => match &c.value {
+            Constant::Str(s) => Some(s.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The name a value is being bound to: `x`, `obj.x` -> `x`, `obj["x"]` -> `x`
+/// -- mirrors `ast_checks._binding_name`.
+fn binding_name(target: &Expr) -> Option<String> {
+    match target {
+        Expr::Name(n) => Some(n.id.to_string()),
+        Expr::Attribute(a) => Some(a.attr.to_string()),
+        Expr::Subscript(s) => str_const(&s.slice),
+        _ => None,
+    }
+}
+
+impl<'a> Collector<'a> {
+    fn record_secret_binding(&mut self, line: usize, target: &Expr, value: &Expr) {
+        if let Some(name) = binding_name(target)
+            && let Some(text) = str_const(value)
+        {
+            self.out.secret_bindings.push((line, name, text));
+        }
+    }
+}
+
 impl<'a> Visitor for Collector<'a> {
     fn visit_expr_call(&mut self, node: ExprCall) {
         let line = self.li.line_number(node.start());
+        for kw in &node.keywords {
+            if let Some(arg) = &kw.arg
+                && let Some(text) = str_const(&kw.value)
+            {
+                self.out.secret_bindings.push((
+                    self.li.line_number(kw.value.start()),
+                    arg.to_string(),
+                    text,
+                ));
+            }
+        }
         let fa = full_attr(&node.func);
         let func_is_bare_name = matches!(node.func.as_ref(), Expr::Name(_));
         let args_dynamic = has_dynamic_arg(&node);
@@ -608,6 +657,13 @@ impl<'a> Visitor for Collector<'a> {
         for c in &node.comparators {
             self.compare_operand_starts.insert(c.start());
         }
+        if let Some(first) = node.comparators.first()
+            && matches!(node.ops.first(), Some(CmpOp::Eq | CmpOp::NotEq))
+        {
+            let line = self.li.line_number(node.start());
+            self.record_secret_binding(line, &node.left, first);
+            self.record_secret_binding(line, first, &node.left);
+        }
         self.generic_visit_expr_compare(node);
     }
 
@@ -650,10 +706,17 @@ impl<'a> Visitor for Collector<'a> {
     }
 
     fn visit_expr_constant(&mut self, node: ExprConstant) {
-        if matches!(&node.value, Constant::Str(s) if s == "0.0.0.0") {
-            self.out
-                .bind_all_lines
-                .push(self.li.line_number(node.start()));
+        if let Constant::Str(s) = &node.value {
+            if s == "0.0.0.0" {
+                self.out
+                    .bind_all_lines
+                    .push(self.li.line_number(node.start()));
+            }
+            if s.chars().count() >= 16 {
+                self.out
+                    .long_str_literals
+                    .push((self.li.line_number(node.start()), s.to_string()));
+            }
         }
         self.generic_visit_expr_constant(node);
     }
@@ -723,6 +786,9 @@ impl<'a> Visitor for Collector<'a> {
 
     fn visit_stmt_assign(&mut self, node: StmtAssign) {
         let line = self.li.line_number(node.start());
+        for t in &node.targets {
+            self.record_secret_binding(line, t, &node.value);
+        }
         if let Some(v) = bool_value(&node.value) {
             for tail in target_tails(&node.targets) {
                 self.out.bool_assigns.push((line, tail, v));
@@ -739,6 +805,9 @@ impl<'a> Visitor for Collector<'a> {
 
     fn visit_stmt_ann_assign(&mut self, node: StmtAnnAssign) {
         let line = self.li.line_number(node.start());
+        if let Some(value) = node.value.as_deref() {
+            self.record_secret_binding(line, &node.target, value);
+        }
         if let Some(v) = node.value.as_deref().and_then(bool_value) {
             for tail in target_tails(std::slice::from_ref(&node.target)) {
                 self.out.bool_assigns.push((line, tail, v));
@@ -753,6 +822,22 @@ impl<'a> Visitor for Collector<'a> {
             });
         }
         self.generic_visit_stmt_ann_assign(node);
+    }
+
+    fn visit_expr_dict(&mut self, node: ExprDict) {
+        for (k, v) in node.keys.iter().zip(&node.values) {
+            if let Some(Expr::Constant(kc)) = k
+                && let Constant::Str(key) = &kc.value
+                && let Some(text) = str_const(v)
+            {
+                self.out.secret_bindings.push((
+                    self.li.line_number(kc.start()),
+                    key.to_string(),
+                    text,
+                ));
+            }
+        }
+        self.generic_visit_expr_dict(node);
     }
 
     fn visit_arguments(&mut self, node: Arguments) {

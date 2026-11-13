@@ -62,11 +62,7 @@ pub fn checks() -> Vec<Check> {
         check!("Command Injection (CWE-78)", check_command_injection, Raw),
         check!("SQL Injection (CWE-89)", check_sql_injection, Raw),
         check!("Path Traversal (CWE-22)", check_path_traversal, Raw),
-        check!(
-            "Hardcoded Secrets (CWE-798)",
-            check_hardcoded_secrets,
-            CodeOnly
-        ),
+        check!("Hardcoded Secrets (CWE-798)", check_hardcoded_secrets, Raw),
         check!(
             "YAML Unsafe Deserialization (CWE-502)",
             check_yaml_deserialize,
@@ -119,11 +115,7 @@ pub fn checks() -> Vec<Check> {
         check!("Log Secrets (CWE-532)", check_log_secrets, Raw),
         check!("Disabled TLS Verify (CWE-295)", check_tls_verify, Raw),
         check!("ZipSlip / TarSlip (CWE-22)", check_zipslip, Raw),
-        check!(
-            "Hardcoded API Keys (CWE-798)",
-            check_hardcoded_tokens,
-            CodeOnly
-        ),
+        check!("Hardcoded API Keys (CWE-798)", check_hardcoded_tokens, Raw),
         check!("Weak Crypto (CWE-327)", check_weak_crypto, CodeOnly),
         check!("Dependency CVE Scan (CWE-1104)", check_dependency_cve, Raw),
         check!("Trojan Source (CWE-1007)", check_trojan_source, Raw),

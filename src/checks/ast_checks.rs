@@ -1850,3 +1850,192 @@ pub fn check_numpy_load_lib(
         })
         .collect()
 }
+
+// ── Hardcoded credentials (CWE-798) -- mirrors the Python pair ─────────────
+
+static SECRET_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)password|passwd|pwd|secret|token|api_key|apikey|access_key|private_key|auth_key|client_secret|authorization",
+    )
+    .unwrap()
+});
+static PRIVATE_KEY_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)private_key|ssh_key|\bpem\b").unwrap());
+static PASSWORD_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)password|passwd|pwd").unwrap());
+static NOT_A_SECRET_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(field|header|name|param|prefix|suffix|type|kind|url|hint|label|help|placeholder|regex|pattern|length|len|path|file|hash_algorithm|algorithm|salt)$",
+    )
+    .unwrap()
+});
+static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)your[-_ ]|placeholder|example|change[-_ ]?me|xxxx|\*\*\*\*|<[^>]+>|^\.\.\.$|dummy|sample|insert[-_ ]|fill[-_ ]?in|redacted|^\$\{|^%\(|%s|\{",
+    )
+    .unwrap()
+});
+static CREDS_IN_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"://[^/\s@:]+:[^@/\s]+@").unwrap());
+/// Values that are a *name*, not a credential: a short all-caps word, an
+/// environment-variable or constant name, a number.
+static CONSTANT_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Z_]{1,12}$|^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$|^\d+(?:\.\d+)?$").unwrap()
+});
+const LITERAL_WORDS: &[&str] = &["None", "none", "null", "True", "true", "False", "false"];
+/// Identifier-shaped and digit-free: as likely a config-key name as a weak
+/// credential; reported at MEDIUM confidence.
+static IDENTIFIER_LIKE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z][A-Za-z_-]*$").unwrap());
+const IDENTIFIER_NOTE: &str =
+    " — value is identifier-like and may be a key name rather than a credential.";
+const PLACEHOLDER_NOTE: &str = " — value looks like a placeholder; confirm it is not used as-is.";
+
+fn normalised(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+static TOKEN_SHAPES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    vec![
+        (
+            Regex::new(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----").unwrap(),
+            "Hardcoded private key (PEM)",
+        ),
+        (
+            Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+").unwrap(),
+            "Hardcoded JWT",
+        ),
+        (
+            Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(),
+            "Hardcoded AWS access key ID",
+        ),
+        (
+            Regex::new(r"\bsk_(?:live|test)_[0-9a-zA-Z]{16,}\b").unwrap(),
+            "Hardcoded Stripe secret key",
+        ),
+        (
+            Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36}\b").unwrap(),
+            "Hardcoded GitHub token",
+        ),
+        (
+            Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b").unwrap(),
+            "Hardcoded Slack token",
+        ),
+        (
+            Regex::new(r"\bAIza[0-9A-Za-z_-]{35}\b").unwrap(),
+            "Hardcoded Google API key",
+        ),
+        (
+            Regex::new(r"\bBearer [A-Za-z0-9_\-.=]{20,}").unwrap(),
+            "Hardcoded bearer token",
+        ),
+    ]
+});
+
+/// `(severity, confidence, description)` if binding `value` to `name` is a
+/// hardcoded credential -- mirrors `ast_checks._classify_secret`.
+fn classify_secret(name: &str, value: &str) -> Option<(Severity, Confidence, String)> {
+    if CREDS_IN_URL_RE.is_match(value) {
+        return Some((
+            Severity::Critical,
+            Confidence::High,
+            "Connection URL with embedded credentials".to_string(),
+        ));
+    }
+    if !SECRET_NAME_RE.is_match(name) || NOT_A_SECRET_NAME_RE.is_match(name) {
+        return None;
+    }
+    if value.chars().count() < 4
+        || LITERAL_WORDS.contains(&value)
+        || CONSTANT_NAME_RE.is_match(value)
+        || normalised(value) == normalised(name)
+    {
+        return None;
+    }
+    let (severity, description) = if PRIVATE_KEY_NAME_RE.is_match(name) {
+        (Severity::Critical, "Hardcoded private key")
+    } else if PASSWORD_NAME_RE.is_match(name) {
+        (Severity::High, "Hardcoded password")
+    } else {
+        (Severity::High, "Hardcoded secret")
+    };
+    if PLACEHOLDER_RE.is_match(value) {
+        return Some((
+            severity,
+            Confidence::Medium,
+            format!("{description}{PLACEHOLDER_NOTE}"),
+        ));
+    }
+    if IDENTIFIER_LIKE_RE.is_match(value) {
+        return Some((
+            severity,
+            Confidence::Medium,
+            format!("{description}{IDENTIFIER_NOTE}"),
+        ));
+    }
+    Some((severity, Confidence::High, description.to_string()))
+}
+
+pub fn check_hardcoded_secrets(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut seen: HashSet<(usize, &str)> = HashSet::new();
+    let mut results = Vec::new();
+    for (line, name, value) in &tree.collected().secret_bindings {
+        let Some((severity, confidence, description)) = classify_secret(name, value) else {
+            continue;
+        };
+        if !seen.insert((*line, name.as_str())) {
+            continue;
+        }
+        results.push(ast_finding(
+            "CWE-798",
+            "Use of Hard-coded Credentials",
+            severity,
+            confidence,
+            pk,
+            lines,
+            *line,
+            description,
+            "Leaked creds in source code are the #1 initial access vector in supply-chain attacks.",
+        ));
+    }
+    results
+}
+
+pub fn check_hardcoded_tokens(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut results = Vec::new();
+    for (line, text) in &tree.collected().long_str_literals {
+        if seen.contains(line) {
+            continue;
+        }
+        if let Some((_, description)) = TOKEN_SHAPES.iter().find(|(re, _)| re.is_match(text)) {
+            seen.insert(*line);
+            results.push(ast_finding(
+                "CWE-798",
+                "Use of Hard-coded Credentials",
+                Severity::Critical,
+                Confidence::High,
+                pk,
+                lines,
+                *line,
+                format!("{description} — plaintext credential in source code."),
+                "Hardcoded cloud API keys are the #1 initial-access vector in supply-chain attacks. Attackers scan public repos for these patterns.",
+            ));
+        }
+    }
+    results
+}

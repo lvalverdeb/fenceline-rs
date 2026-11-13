@@ -45,79 +45,6 @@ fn finding(
     }
 }
 
-/// Shared false-positive guard for hardcoded-secret-shaped patterns --
-/// mirrors `_is_secret_false_positive`.
-fn is_secret_false_positive(line: &str) -> bool {
-    let low = line.to_lowercase();
-    if low.contains("environ") || low.contains("getenv") || low.contains("config") {
-        return true;
-    }
-    if ["your-", "placeholder", "...", "example", "xxxx", "****"]
-        .iter()
-        .any(|x| low.contains(x))
-    {
-        return true;
-    }
-    if low.contains("connection_url")
-        && (line.contains('{') || line.contains('}') || low.contains("dialect"))
-    {
-        return true;
-    }
-    false
-}
-
-// ── check_hardcoded_secrets (CWE-798) ────────────────────────────────────
-//
-// Matched case-insensitively (`(?i)`) -- UPPER_SNAKE_CASE module constants
-// (`PASSWORD = "..."`) are the standard Python convention for exactly this
-// kind of value and were otherwise invisible. Mirrors the Python fix.
-
-static HARDCODED_SECRET_PATTERNS: LazyLock<Vec<(Regex, Severity, &'static str)>> =
-    LazyLock::new(|| {
-        vec![
-            (
-                Regex::new(r#"(?i)(?:private_key|ssh_key|pem)\s*[:=]\s*["'][^"']+["']"#).unwrap(),
-                Severity::Critical,
-                "Hardcoded private key",
-            ),
-            (
-                Regex::new(r#"(?i)connection_url\s*=\s*["'][^"']*://[^"']+:[^"']+@"#).unwrap(),
-                Severity::Critical,
-                "Connection URL with embedded credentials",
-            ),
-            (
-                Regex::new(r#"(?i)(?:password|passwd|pwd)\s*[:=]\s*["'][^"']{4,}["']"#).unwrap(),
-                Severity::High,
-                "Hardcoded password",
-            ),
-        ]
-    });
-
-pub fn check_hardcoded_secrets(
-    _path: &Path,
-    pk: &str,
-    lines: Lines,
-    _tree: Option<&ParsedFile>,
-) -> Vec<Finding> {
-    let mut results = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
-        }
-        for (pat, sev, desc) in HARDCODED_SECRET_PATTERNS.iter() {
-            if pat.is_match(line) && !is_secret_false_positive(line) {
-                results.push(finding(
-                    "CWE-798", "Use of Hard-coded Credentials", *sev, Confidence::default(),
-                    pk, i + 1, line.trim(), desc.to_string(),
-                    "Leaked creds in source code are the #1 initial access vector in supply-chain attacks.",
-                ));
-                break;
-            }
-        }
-    }
-    results
-}
-
 // ── check_xxe (CWE-611) ──────────────────────────────────────────────────
 
 static XXE_RE: LazyLock<Regex> =
@@ -434,47 +361,6 @@ pub fn check_ldap(
 // ── check_log_injection (CWE-117) ────────────────────────────────────────
 
 // ── check_log_secrets (CWE-532) ──────────────────────────────────────────
-
-// ── check_hardcoded_tokens (CWE-798) ─────────────────────────────────────
-
-// Matched case-insensitively (`(?i)`) -- UPPER_SNAKE_CASE module constants
-// (`API_KEY = "..."`) are the standard Python convention for exactly this
-// kind of value and were otherwise invisible. Mirrors the Python fix.
-static HARDCODED_TOKEN_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-    vec![
-        (Regex::new(r#"(?i)(?:api_key|apikey)\s*[:=]\s*["'][A-Za-z0-9_\-=]{16,}["']"#).unwrap(), "Hardcoded API key"),
-        (Regex::new(r#"(?i)(?:token|jwt)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+["']"#).unwrap(), "Hardcoded JWT token"),
-        (Regex::new(r#"(?i)(?:bearer|auth_token)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']"#).unwrap(), "Hardcoded bearer / auth token"),
-        (Regex::new(r#"(?i)(?:secret|client_secret)\s*[:=]\s*["'][A-Za-z0-9_\-+/=]{16,}["']"#).unwrap(), "Hardcoded secret"),
-    ]
-});
-
-pub fn check_hardcoded_tokens(
-    _path: &Path,
-    pk: &str,
-    lines: Lines,
-    _tree: Option<&ParsedFile>,
-) -> Vec<Finding> {
-    let mut results = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
-        }
-        let stripped = line.trim();
-        for (pat, desc) in HARDCODED_TOKEN_PATTERNS.iter() {
-            if pat.is_match(stripped) && !is_secret_false_positive(stripped) {
-                results.push(finding(
-                    "CWE-798", "Use of Hard-coded Credentials", Severity::Critical, Confidence::default(),
-                    pk, i + 1, stripped,
-                    format!("{desc} — plaintext credential in source code."),
-                    "Hardcoded cloud API keys are the #1 initial-access vector in supply-chain attacks. Attackers scan public repos for these patterns.",
-                ));
-                break;
-            }
-        }
-    }
-    results
-}
 
 // ── check_weak_crypto (CWE-327) ──────────────────────────────────────────
 
