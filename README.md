@@ -130,7 +130,7 @@ SARIF viewer. The repository also ships a `.pre-commit-hooks.yaml`, so
 ```yaml
 repos:
   - repo: https://github.com/lvalverdeb/fenceline-rs
-    rev: v1.6.0
+    rev: v1.7.0
     hooks:
       - id: fenceline
 ```
