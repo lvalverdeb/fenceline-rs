@@ -112,6 +112,14 @@ fenceline --write-baseline fenceline-baseline.json   # snapshot today's findings
 fenceline --baseline fenceline-baseline.json          # only new findings fail CI
 ```
 
+### How it compares
+
+The Python repository's `benchmark/` directory holds a labelled comparison
+against Bandit and Semgrep on three intentionally vulnerable apps; this port
+produces the identical 139 findings there, so its numbers are the same. Run
+it against the binary with
+`FENCELINE_CMD=target/release/fenceline ../fenceline/benchmark/run.sh`.
+
 ### CI integration
 
 `--sarif` writes the scan as a SARIF 2.1.0 log (one rule per CWE with a MITRE
