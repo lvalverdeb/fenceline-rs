@@ -16,12 +16,6 @@
       "cwe_id": "CWE-93",
       "severity": "HIGH",
       "confidence": "MEDIUM",
-      "line": 3
-    },
-    {
-      "cwe_id": "CWE-93",
-      "severity": "HIGH",
-      "confidence": "MEDIUM",
       "line": 4
     }
   ]

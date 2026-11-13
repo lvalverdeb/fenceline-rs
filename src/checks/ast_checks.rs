@@ -5,13 +5,12 @@
 //! itself.
 
 use crate::analysis::ParsedFile;
-use crate::ast_helpers::{
-    call_name, dotted_matches, full_attr, is_locally_safe_expr, resolve_dotted, skip,
-};
+use crate::ast_helpers::{call_name, dotted_matches, full_attr, resolve_dotted, skip};
 use crate::models::{Confidence, Finding, Severity};
+use crate::taint::{Taint, confidence_for};
 use regex::{Regex, RegexBuilder};
-use rustpython_ast::{Expr, ExprCall, Operator, Ranged};
-use std::collections::HashSet;
+use rustpython_ast::{Expr, ExprCall, Ranged};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -34,47 +33,39 @@ pub fn check_eval_exec(
     let collected = tree.collected();
     let mut results = Vec::new();
     for call in &collected.calls {
-        match call.full_attr.as_str() {
-            "eval" | "exec" => results.push(Finding {
-                cwe_id: "CWE-94",
-                cwe_name: "Code Injection",
-                severity: Severity::Critical,
-                confidence: Confidence::High,
-                package: String::new(),
-                file: pk.to_string(),
-                line: call.line,
-                code_snippet: code_at(lines, call.line),
-                description: "eval()/exec() with dynamic input allows arbitrary code execution."
+        let (severity, description) = match call.full_attr.as_str() {
+            "eval" | "exec" => (
+                Severity::Critical,
+                format!(
+                    "{}() with dynamic input allows arbitrary code execution.",
+                    call.full_attr
+                ),
+            ),
+            "compile" if !call.is_excluded_compile && call.func_is_bare_name => (
+                Severity::Critical,
+                "compile() with dynamic input can enable arbitrary code execution.".to_string(),
+            ),
+            "__import__" => (
+                Severity::High,
+                "Dynamic __import__() can import arbitrary modules if argument is user-controlled."
                     .to_string(),
-                zero_day_relevance: "",
-            }),
-            "compile" if !call.is_excluded_compile && call.func_is_bare_name && call.args_dynamic => results.push(Finding {
-                cwe_id: "CWE-94",
-                cwe_name: "Code Injection",
-                severity: Severity::Critical,
-                confidence: Confidence::High,
-                package: String::new(),
-                file: pk.to_string(),
-                line: call.line,
-                code_snippet: code_at(lines, call.line),
-                description: "compile() with dynamic input can enable arbitrary code execution."
-                    .to_string(),
-                zero_day_relevance: "",
-            }),
-            "__import__" => results.push(Finding {
-                cwe_id: "CWE-94",
-                cwe_name: "Code Injection",
-                severity: Severity::High,
-                confidence: Confidence::High,
-                package: String::new(),
-                file: pk.to_string(),
-                line: call.line,
-                code_snippet: code_at(lines, call.line),
-                description: "Dynamic __import__() can import arbitrary modules if argument is user-controlled.".to_string(),
-                zero_day_relevance: "",
-            }),
-            _ => {}
-        }
+            ),
+            _ => continue,
+        };
+        let Some((confidence, note)) = confidence_for(call.data_taint) else {
+            continue;
+        };
+        results.push(ast_finding(
+            "CWE-94",
+            "Code Injection",
+            severity,
+            confidence,
+            pk,
+            lines,
+            call.line,
+            description + note,
+            "",
+        ));
     }
     results
 }
@@ -372,37 +363,41 @@ pub fn check_pandas_eval(
     let collected = tree.collected();
     let mut results = Vec::new();
     for c in &collected.calls {
-        if c.full_attr == "pandas.eval" || c.full_attr == "pd.eval" {
-            results.push(Finding {
-                cwe_id: "CWE-94",
-                cwe_name: "Code Injection (pandas eval)",
-                severity: Severity::Critical,
-                confidence: Confidence::High,
-                package: String::new(),
-                file: pk.to_string(),
-                line: c.line,
-                code_snippet: code_at(lines, c.line),
-                description: "pandas.eval() evaluates arbitrary Python expressions — code injection if user input reaches the expression.".to_string(),
-                zero_day_relevance: "CVE-2024-9880 / Trail of Bits: pandas.eval() / df.query() sandbox bypass via dunder methods. Pandas docs now warn explicitly.",
-            });
+        let (cwe_name, severity, description, zero_day) = if c.full_attr == "pandas.eval"
+            || c.full_attr == "pd.eval"
+        {
+            (
+                "Code Injection (pandas eval)",
+                Severity::Critical,
+                "pandas.eval() evaluates arbitrary Python expressions — code injection if user input reaches the expression.",
+                "CVE-2024-9880 / Trail of Bits: pandas.eval() / df.query() sandbox bypass via dunder methods. Pandas docs now warn explicitly.",
+            )
         } else if matches!(c.full_attr.rsplit('.').next(), Some("eval") | Some("query"))
-            && c.full_attr != "pandas.eval"
-            && c.full_attr != "pd.eval"
             && c.full_attr.contains('.')
         {
-            results.push(Finding {
-                cwe_id: "CWE-94",
-                cwe_name: "Code Injection (DataFrame eval/query)",
-                severity: Severity::High,
-                confidence: Confidence::High,
-                package: String::new(),
-                file: pk.to_string(),
-                line: c.line,
-                code_snippet: code_at(lines, c.line),
-                description: "DataFrame.eval() or DataFrame.query() evaluates Python expressions — code injection if user-controlled input reaches the expression.".to_string(),
-                zero_day_relevance: "CVE-2024-9880: pandas.DataFrame.query() sandbox bypass. Thousands of attribute chains lead to os.system.",
-            });
-        }
+            (
+                "Code Injection (DataFrame eval/query)",
+                Severity::High,
+                "DataFrame.eval() or DataFrame.query() evaluates Python expressions — code injection if user-controlled input reaches the expression.",
+                "CVE-2024-9880: pandas.DataFrame.query() sandbox bypass. Thousands of attribute chains lead to os.system.",
+            )
+        } else {
+            continue;
+        };
+        let Some((confidence, note)) = confidence_for(c.data_taint) else {
+            continue;
+        };
+        results.push(ast_finding(
+            "CWE-94",
+            cwe_name,
+            severity,
+            confidence,
+            pk,
+            lines,
+            c.line,
+            format!("{description}{note}"),
+            zero_day,
+        ));
     }
     results
 }
@@ -823,32 +818,39 @@ pub fn check_command_injection(
     let collected = tree.collected();
     let mut results = Vec::new();
     for call in &collected.calls {
-        if let Some((name, sev)) = COMMAND_CALLS
+        let matched = COMMAND_CALLS
             .iter()
-            .find(|(name, _)| dotted_matches(&call.full_attr, name))
-        {
+            .find(|(name, _)| dotted_matches(&call.full_attr, name));
+        let shell = call.keyword_true_names.iter().any(|k| k == "shell");
+        if matched.is_none() && !shell {
+            continue;
+        }
+        let Some((confidence, note)) = confidence_for(call.command_taint) else {
+            continue;
+        };
+        if let Some((name, sev)) = matched {
             results.push(ast_finding(
                 "CWE-78",
                 "OS Command Injection",
                 *sev,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 call.line,
-                format!("{name}() spawns subprocesses; may allow command injection if arguments are unvalidated."),
+                format!("{name}() spawns subprocesses; may allow command injection if arguments are unvalidated.{note}"),
                 "CWE-78: 20 CVEs in KEV. Still a top Python zero-day vector.",
             ));
         }
-        if call.keyword_true_names.iter().any(|k| k == "shell") {
+        if shell {
             results.push(ast_finding(
                 "CWE-78",
                 "OS Command Injection",
                 Severity::High,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 call.line,
-                "shell=True enables shell injection in subprocess calls.".to_string(),
+                format!("shell=True enables shell injection in subprocess calls.{note}"),
                 "",
             ));
         }
@@ -903,17 +905,18 @@ pub fn check_ssti(
     collected
         .calls
         .iter()
-        .filter(|c| c.call_name == "Template" && c.args_dynamic)
-        .map(|c| {
+        .filter(|c| c.call_name == "Template")
+        .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
+        .map(|(c, (confidence, note))| {
             ast_finding(
                 "CWE-1336",
                 "Server-Side Template Injection",
                 Severity::High,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 c.line,
-                "Template instantiation — SSTI if template string is user-controlled.".to_string(),
+                format!("Template instantiation — SSTI if template string is user-controlled.{note}"),
                 "CVE-2025-68664: LangChain Core SSTI zero-day chaining deserialisation + Jinja2 for RCE.",
             )
         })
@@ -928,28 +931,30 @@ pub fn check_crlf(
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
     let collected = tree.collected();
-    let mut hit_lines: Vec<usize> = collected.crlf_combo_lines.clone();
-    hit_lines.extend(
-        collected
-            .calls
-            .iter()
-            .filter(|c| c.is_crlf_format_call)
-            .map(|c| c.line),
-    );
-    hit_lines.sort_unstable();
-    hit_lines.dedup();
-    hit_lines
+    // Several hits on one line report once, at the worst taint among them.
+    let mut by_line: BTreeMap<usize, Taint> = BTreeMap::new();
+    let format_calls = collected
+        .calls
+        .iter()
+        .filter(|c| c.is_crlf_format_call)
+        .map(|c| (c.line, c.data_taint));
+    for (line, taint) in collected.crlf_combos.iter().copied().chain(format_calls) {
+        let worst = by_line.entry(line).or_insert(Taint::Clean);
+        *worst = (*worst).max(taint);
+    }
+    by_line
         .into_iter()
-        .map(|line| {
+        .filter_map(|(line, taint)| confidence_for(taint).map(|t| (line, t)))
+        .map(|(line, (confidence, note))| {
             ast_finding(
                 "CWE-93",
                 "CRLF Injection",
                 Severity::High,
-                Confidence::Medium,
+                confidence,
                 pk,
                 lines,
                 line,
-                "CRLF sequence combined with non-literal data — may enable HTTP response splitting / log injection.".to_string(),
+                format!("CRLF sequence combined with non-literal data — may enable HTTP response splitting / log injection.{note}"),
                 "",
             )
         })
@@ -1024,17 +1029,20 @@ pub fn check_open_redirect(
     collected
         .calls
         .iter()
-        .filter(|c| (c.call_name == "redirect" || c.call_name == "Redirect") && c.args_dynamic)
-        .map(|c| {
+        .filter(|c| c.call_name == "redirect" || c.call_name == "Redirect")
+        .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
+        .map(|(c, (confidence, note))| {
             ast_finding(
                 "CWE-601",
                 "Open Redirect",
                 Severity::Medium,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 c.line,
-                "URL redirect — ensure destination is validated against an allowlist.".to_string(),
+                format!(
+                    "URL redirect — ensure destination is validated against an allowlist.{note}"
+                ),
                 "",
             )
         })
@@ -1119,37 +1127,6 @@ pub fn check_tls_verify(
 
 // ── Phase 2, second increment ─────────────────────────────────────────────
 
-fn all_constant(e: &Expr) -> bool {
-    match e {
-        Expr::Constant(_) => true,
-        Expr::BinOp(b) => all_constant(&b.left) && all_constant(&b.right),
-        _ => false,
-    }
-}
-
-/// `"f-string"` for an f-string with at least one interpolation,
-/// `"concatenation"` for `+`/`%` on a non-literal or `"...".format(x)`, else
-/// `None` -- the three ways a query gets data spliced into it. Mirrors
-/// `ast_checks._sql_shape`.
-fn sql_shape(arg: &Expr) -> Option<&'static str> {
-    match arg {
-        Expr::JoinedStr(j) => j
-            .values
-            .iter()
-            .any(|v| matches!(v, Expr::FormattedValue(_)))
-            .then_some("f-string"),
-        Expr::BinOp(b) if matches!(b.op, Operator::Add | Operator::Mod) => {
-            (!all_constant(arg)).then_some("concatenation")
-        }
-        Expr::Call(c) => (matches!(
-            c.func.as_ref(),
-            Expr::Attribute(a) if a.attr.as_str() == "format" && matches!(a.value.as_ref(), Expr::Constant(_))
-        ) && (!c.args.is_empty() || !c.keywords.is_empty()))
-            .then_some("concatenation"),
-        _ => None,
-    }
-}
-
 const SQL_EXEC_METHOD_NAMES: &[&str] = &["execute", "exec_driver_sql"];
 
 pub fn check_sql_injection(
@@ -1159,35 +1136,33 @@ pub fn check_sql_injection(
     tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let li = tree.line_index();
     let mut results = Vec::new();
-    for scoped in tree.scoped_calls() {
-        let name = call_name(&scoped.call);
-        if !SQL_EXEC_METHOD_NAMES.contains(&name.as_str()) {
+    for call in &tree.collected().calls {
+        let name = call.call_name.as_str();
+        if !SQL_EXEC_METHOD_NAMES.contains(&name) {
             continue;
         }
-        let Some(arg) = scoped.call.args.first() else {
+        let (Some(shape), Some(taint)) = (call.first_arg_sql_shape, call.first_arg_taint) else {
             continue;
         };
-        let Some(shape) = sql_shape(arg) else {
+        let Some((confidence, note)) = confidence_for(taint) else {
             continue;
         };
-        if is_locally_safe_expr(arg, &scoped.params, &scoped.literals, &scoped.imports, 0) {
-            continue;
-        }
         let desc = if shape == "f-string" {
-            format!("f-string in {name}() — probable SQL injection")
+            format!("f-string in {name}() — probable SQL injection{note}")
         } else {
-            format!("String concatenation or %-formatting in {name}() — probable SQL injection")
+            format!(
+                "String concatenation or %-formatting in {name}() — probable SQL injection{note}"
+            )
         };
         results.push(ast_finding(
             "CWE-89",
             "SQL Injection",
             Severity::Critical,
-            Confidence::High,
+            confidence,
             pk,
             lines,
-            li.line_number(scoped.call.start()),
+            call.line,
             desc,
             "CWE-89 rose to #2 in 2025 Top 25. Most exploited injection class after XSS.",
         ));
@@ -1202,29 +1177,23 @@ pub fn check_exec_driver_sql(
     tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let li = tree.line_index();
     let mut results = Vec::new();
-    for scoped in tree.scoped_calls() {
-        if call_name(&scoped.call) != "exec_driver_sql" {
+    for call in &tree.collected().calls {
+        if call.call_name != "exec_driver_sql" || call.first_arg_sql_shape != Some("f-string") {
             continue;
         }
-        let Some(arg) = scoped.call.args.first() else {
+        let Some((confidence, note)) = call.first_arg_taint.and_then(confidence_for) else {
             continue;
         };
-        if sql_shape(arg) != Some("f-string")
-            || is_locally_safe_expr(arg, &scoped.params, &scoped.literals, &scoped.imports, 0)
-        {
-            continue;
-        }
         results.push(ast_finding(
             "CWE-89",
             "SQL Injection",
             Severity::Critical,
-            Confidence::High,
+            confidence,
             pk,
             lines,
-            li.line_number(scoped.call.start()),
-            "exec_driver_sql() with f-string — direct SQL injection.".to_string(),
+            call.line,
+            format!("exec_driver_sql() with f-string — direct SQL injection.{note}"),
             "",
         ));
     }
@@ -1285,19 +1254,19 @@ pub fn check_ssrf(
         let Some(url) = ssrf_url_arg(&scoped.call) else {
             continue;
         };
-        if is_locally_safe_expr(url, &scoped.params, &scoped.literals, &scoped.imports, 0) {
+        let taint = tree.taint().classify(scoped.call.start(), [url]);
+        let Some((confidence, note)) = confidence_for(taint) else {
             continue;
-        }
+        };
         results.push(ast_finding(
             "CWE-918",
             "Server-Side Request Forgery",
             Severity::High,
-            Confidence::High,
+            confidence,
             pk,
             lines,
             li.line_number(scoped.call.start()),
-            "HTTP request — verify URL is validated against allowlist; SSRF if user-controlled."
-                .to_string(),
+            format!("HTTP request — verify URL is validated against allowlist; SSRF if user-controlled.{note}"),
             "CWE-918 fell to #22 but SSRF zero-days (cloud metadata exfiltration) remain critical.",
         ));
     }
@@ -1397,18 +1366,18 @@ pub fn check_arbitrary_write(
     tree.collected()
         .calls
         .iter()
-        .filter(|c| is_file_move_or_copy(&c.full_attr) && c.args_dynamic)
-        .map(|c| {
+        .filter(|c| is_file_move_or_copy(&c.full_attr))
+        .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
+        .map(|(c, (confidence, note))| {
             ast_finding(
                 "CWE-73",
                 "External Control of File Name",
                 Severity::Medium,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 c.line,
-                "File operation — verify destination path is validated to prevent arbitrary write."
-                    .to_string(),
+                format!("File operation — verify destination path is validated to prevent arbitrary write.{note}"),
                 "",
             )
         })
@@ -1593,31 +1562,41 @@ pub fn check_path_traversal(
     let Some(tree) = tree else { return vec![] };
     let mut results = Vec::new();
     for c in &tree.collected().calls {
-        if c.call_name == "lstrip" && c.first_arg_str.as_deref() == Some("/") {
-            results.push(ast_finding(
-                "CWE-22",
-                "Path Traversal",
+        // For `x.lstrip("/")` the value being "sanitised" is the receiver.
+        let (taint, severity, description, zero_day) = if c.call_name == "lstrip"
+            && c.first_arg_str.as_deref() == Some("/")
+            && let Some(receiver) = c.receiver_taint
+        {
+            (
+                receiver,
                 Severity::High,
-                Confidence::High,
-                pk,
-                lines,
-                c.line,
-                "lstrip('/') does NOT prevent ../ traversal — use Path.resolve() + is_relative_to().".to_string(),
+                "lstrip('/') does NOT prevent ../ traversal — use Path.resolve() + is_relative_to().",
                 "CWE-22 is #6 in Top 25 with 10 CVEs in KEV.",
-            ));
+            )
         } else if c.call_name == "open" && c.arg_names.iter().any(|n| n.contains("relative_path")) {
-            results.push(ast_finding(
-                "CWE-22",
-                "Path Traversal",
+            (
+                c.data_taint,
                 Severity::Medium,
-                Confidence::High,
-                pk,
-                lines,
-                c.line,
-                "Variable named 'relative_path' used in open() — verify ../ is rejected with Path.resolve().".to_string(),
+                "Variable named 'relative_path' used in open() — verify ../ is rejected with Path.resolve().",
                 "",
-            ));
-        }
+            )
+        } else {
+            continue;
+        };
+        let Some((confidence, note)) = confidence_for(taint) else {
+            continue;
+        };
+        results.push(ast_finding(
+            "CWE-22",
+            "Path Traversal",
+            severity,
+            confidence,
+            pk,
+            lines,
+            c.line,
+            format!("{description}{note}"),
+            zero_day,
+        ));
     }
     results
 }

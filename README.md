@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`fenceline`](https://github.com/lval
 
 The [Python original](https://github.com/lvalverdeb/fenceline) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/fenceline/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk uncovered and matched along the way (some quite subtle — e.g. `check_assert_security`'s `\b(is|==|!=|in)\b` provably never matching `==`/`!=` written the normal way with spaces or quotes around them).
 
-**Status**: all 57 checks ported (37 AST-based, 18 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 59 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
+**Status**: all 57 checks ported (37 AST-based, 18 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 62 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
 
 ## Why It Exists
 
@@ -64,7 +64,17 @@ other = "../other/src/other"
 
 ## Severity vs. confidence
 
-Every finding carries two independent ratings: **severity** is how bad it would be if the finding is real; **confidence** is how sure the check is that it *is* real. An AST-based check that matched a real call node is `HIGH` confidence; a text-based check that can't fully rule out a docstring or string-literal mention is `MEDIUM`/`LOW`. Use `--confidence-min medium` to cut noise from the fuzzier checks without raising your severity bar.
+Every finding carries two independent ratings: **severity** is how bad it would be if the finding is real; **confidence** is how sure the check is that it *is* real. A text-based check that can't fully rule out a docstring or string-literal mention is `MEDIUM`/`LOW`; for most AST checks, matching a real call node is all there is to know, and the finding is `HIGH`.
+
+For the injection-shaped checks (command, code, SQL, template and CRLF injection, SSRF, open redirect, path traversal, arbitrary file write, pandas `eval`/`query`), the call's shape is not enough: `subprocess.run(cmd)` is a finding or not depending on where `cmd` came from. These checks trace the sink's arguments back through the enclosing function (`src/taint.rs`, mirroring the Python original's `fenceline.taint`) and set confidence from what they find:
+
+| The sink is fed by | Confidence |
+| --- | --- |
+| A recognised entry point: a `request` object, `os.environ`, `sys.argv`, `input()`, a socket read, or a parameter of a route-decorated function or handler method | `HIGH` |
+| Plain function parameters, `self` attributes, or values the function cannot resolve | `MEDIUM`, with a note on the finding |
+| Only literals, module constants, library references, or values that cannot carry a payload (a length, an `int()`, a `shlex.quote()`) | not reported |
+
+The analysis stays inside one function and follows assignments without regard to order, so it is deliberately pessimistic. Use `--confidence-min medium` to cut noise from the fuzzier regex checks, and `--confidence-min high` to see only findings where attacker-controlled input provably reaches the sink.
 
 ## Severity policy
 
@@ -103,6 +113,7 @@ fenceline --baseline fenceline-baseline.json          # only new findings fail C
 
 ## Design
 
+- `taint` — per-function source tracking for the injection-shaped checks (mirrors `fenceline/taint.py`).
 - `models` — the `Finding` struct, plus `Severity`/`Confidence` enums whose declared variant order matches the Python `SEVERITY_ORDER`/`CONFIDENCE_ORDER` dicts exactly (so a derived `Ord` sorts the same way).
 - `config` — workspace-root discovery (walks upward for a `pyproject.toml` declaring `[tool.uv.workspace]`), the default package registry, and `is_secure_path` (a from-scratch reimplementation of the Python original's `boti.core.is_secure_path` sandbox check — see the module docs for one disclosed divergence: `std::fs::canonicalize` requires the target to exist, unlike Python's `Path.resolve()`).
 - `ast_helpers` — shared AST/text-matching helpers used across checks.

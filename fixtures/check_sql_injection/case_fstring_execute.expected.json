@@ -3,7 +3,7 @@
     {
       "cwe_id": "CWE-89",
       "severity": "CRITICAL",
-      "confidence": "HIGH",
+      "confidence": "MEDIUM",
       "line": 1
     }
   ]

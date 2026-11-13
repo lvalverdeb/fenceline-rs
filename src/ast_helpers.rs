@@ -7,9 +7,9 @@
 use regex::Regex;
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
-    Arguments, Comprehension, Expr, ExprCall, ExprLambda, Keyword, ModModule, Stmt, StmtAnnAssign,
-    StmtAssign, StmtAsyncFunctionDef, StmtAsyncWith, StmtClassDef, StmtFunctionDef, StmtImport,
-    StmtImportFrom, StmtWith, Visitor, WithItem,
+    Arguments, Comprehension, Expr, ExprCall, ExprLambda, Keyword, ModModule, Operator, Stmt,
+    StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef, StmtAsyncWith, StmtClassDef, StmtFunctionDef,
+    StmtImport, StmtImportFrom, StmtWith, Visitor, WithItem,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -294,13 +294,10 @@ pub fn skip(line: &str) -> bool {
 
 // ── Local (same-function-scope) constant resolution ──────────────────────
 //
-// Mirrors `ast_helpers.py`'s own local-resolution helpers. Deliberately
-// NOT full taint tracking: this only ever looks at the same function's own
-// body plus the enclosing module's top-level constants and imports -- never
-// across a function/call boundary. It exists to answer one narrow question
-// well: "is this expression built entirely from string literals,
-// module-level constants, and library references, with no dependency on
-// this function's own parameters or any other name we can't account for?"
+// Mirrors `ast_helpers.py`'s own local-resolution helpers: the same
+// function's own body plus the enclosing module's top-level constants and
+// imports -- never across a function/call boundary. `crate::taint` builds
+// on the same scope model to classify a sink's inputs.
 
 /// `(name -> assigned value, names bound by import statements or sibling
 /// function definitions)` for every simple `Name = value`/`Name: T = value`
@@ -329,8 +326,8 @@ impl Visitor for ScopeNamesCollector {
     // (checked recursively via each argument), exactly like calling
     // `requests.get(...)` doesn't require inspecting `requests`' own
     // internals. Without this, routing a call through any local helper
-    // function -- rather than inlining it -- made `is_locally_safe_expr`
-    // treat the whole expression as unsafe regardless of its arguments.
+    // function -- rather than inlining it -- made the safety test treat the
+    // whole expression as unsafe regardless of its arguments.
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
         self.imports.insert(node.name.to_string());
     }
@@ -543,58 +540,33 @@ pub fn iter_calls_in_scope(tree: &ModModule) -> Vec<ScopedCall> {
     result
 }
 
-/// True if `expr` doesn't reference this function's own parameters (the
-/// boundary of "external input" in a same-function-scope model) or any
-/// name that can't be resolved within the same scope at all -- i.e. it's
-/// built entirely from string literals, function/module-local constants,
-/// and calls/attribute access on imported names -- mirrors
-/// `ast_helpers._is_locally_safe_expr`. Recursion depth is capped
-/// defensively; a pathologically deep expression just falls through to
-/// the conservative "not safe" default rather than the check ever hanging.
-pub fn is_locally_safe_expr(
-    expr: &Expr,
-    params: &HashSet<String>,
-    literals: &HashMap<String, Expr>,
-    imports: &HashSet<String>,
-    depth: u8,
-) -> bool {
-    if depth > 8 {
-        return false;
-    }
-    match expr {
+fn all_constant(e: &Expr) -> bool {
+    match e {
         Expr::Constant(_) => true,
-        Expr::Name(n) => {
-            let id = n.id.as_str();
-            if params.contains(id) {
-                false
-            } else if imports.contains(id) {
-                true
-            } else if let Some(value) = literals.get(id) {
-                is_locally_safe_expr(value, params, literals, imports, depth + 1)
-            } else {
-                false
-            }
-        }
-        Expr::Attribute(a) => is_locally_safe_expr(&a.value, params, literals, imports, depth + 1),
-        Expr::Call(c) => {
-            is_locally_safe_expr(&c.func, params, literals, imports, depth + 1)
-                && c.args
-                    .iter()
-                    .all(|a| is_locally_safe_expr(a, params, literals, imports, depth + 1))
-                && c.keywords
-                    .iter()
-                    .all(|kw| is_locally_safe_expr(&kw.value, params, literals, imports, depth + 1))
-        }
-        Expr::JoinedStr(js) => js.values.iter().all(|v| match v {
-            Expr::FormattedValue(fv) => {
-                is_locally_safe_expr(&fv.value, params, literals, imports, depth + 1)
-            }
-            _ => true,
-        }),
-        Expr::BinOp(b) => {
-            is_locally_safe_expr(&b.left, params, literals, imports, depth + 1)
-                && is_locally_safe_expr(&b.right, params, literals, imports, depth + 1)
-        }
+        Expr::BinOp(b) => all_constant(&b.left) && all_constant(&b.right),
         _ => false,
+    }
+}
+
+/// `"f-string"` for an f-string with at least one interpolation,
+/// `"concatenation"` for `+`/`%` on a non-literal or `"...".format(x)`, else
+/// `None` -- the three ways a query gets data spliced into it. Mirrors
+/// `ast_checks._sql_shape`.
+pub fn sql_shape(arg: &Expr) -> Option<&'static str> {
+    match arg {
+        Expr::JoinedStr(j) => j
+            .values
+            .iter()
+            .any(|v| matches!(v, Expr::FormattedValue(_)))
+            .then_some("f-string"),
+        Expr::BinOp(b) if matches!(b.op, Operator::Add | Operator::Mod) => {
+            (!all_constant(arg)).then_some("concatenation")
+        }
+        Expr::Call(c) => (matches!(
+            c.func.as_ref(),
+            Expr::Attribute(a) if a.attr.as_str() == "format" && matches!(a.value.as_ref(), Expr::Constant(_))
+        ) && (!c.args.is_empty() || !c.keywords.is_empty()))
+            .then_some("concatenation"),
+        _ => None,
     }
 }

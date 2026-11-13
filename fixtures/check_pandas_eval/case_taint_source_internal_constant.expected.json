@@ -1,0 +1,22 @@
+{
+  "findings": [
+    {
+      "cwe_id": "CWE-94",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 7
+    },
+    {
+      "cwe_id": "CWE-94",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "line": 11
+    },
+    {
+      "cwe_id": "CWE-94",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "line": 19
+    }
+  ]
+}

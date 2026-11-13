@@ -8,9 +8,10 @@
 
 use crate::ast_helpers::{
     LineIndex, ScopedCall, call_name, full_attr, has_dynamic_arg, is_re_compile,
-    is_sqlalchemy_compile, iter_calls_in_scope, resolve_dotted, walk_arguments_children,
+    is_sqlalchemy_compile, iter_calls_in_scope, resolve_dotted, sql_shape, walk_arguments_children,
     walk_comprehension_children, walk_keyword_children, walk_withitem_children,
 };
+use crate::taint::{Taint, TaintIndex};
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
     Arguments, Comprehension, Constant, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprBinOp,
@@ -186,6 +187,17 @@ pub struct CallRec {
     /// (opening-paren) line, so a multi-line call flags the line the
     /// dangerous keyword actually sits on.
     pub allow_pickle_kw_line: Option<usize>,
+    /// Taint of every positional and keyword argument (`_call_data`).
+    pub data_taint: Taint,
+    /// Taint of the positional arguments plus `args=`/`cmd=` -- the command
+    /// a subprocess call runs, without `shell=`/`cwd=`/`env=`.
+    pub command_taint: Taint,
+    /// Taint of the first positional argument.
+    pub first_arg_taint: Option<Taint>,
+    /// Taint of the receiver (`x` in `x.lstrip("/")`) for a method call.
+    pub receiver_taint: Option<Taint>,
+    /// `ast_helpers::sql_shape` of the first positional argument.
+    pub first_arg_sql_shape: Option<&'static str>,
 }
 
 pub struct ExceptRec {
@@ -239,9 +251,10 @@ pub struct Collected {
     pub bind_all_lines: Vec<usize>,
     /// `(line, name)` for every reference to a deprecated SSL/TLS protocol constant.
     pub weak_tls_refs: Vec<(usize, String)>,
-    /// Lines where a CRLF-bearing literal is combined with non-literal data
-    /// via `+`, `%`, or an f-string (`.format()` is recorded on the call).
-    pub crlf_combo_lines: Vec<usize>,
+    /// `(line, taint of the joined data)` where a CRLF-bearing literal is
+    /// combined with non-literal data via `+`, `%`, or an f-string
+    /// (`.format()` is recorded on the call).
+    pub crlf_combos: Vec<(usize, Taint)>,
     pub excepts: Vec<ExceptRec>,
     pub funcdefs: Vec<FuncDefRec>,
     pub assigns: Vec<AssignRec>,
@@ -251,6 +264,7 @@ pub struct Collected {
 
 struct Collector<'a> {
     li: &'a LineIndex,
+    taint: &'a TaintIndex,
     out: Collected,
     /// Start offsets of every `Compare` operand, so a `CERT_NONE` reference
     /// can be told apart from `== ssl.CERT_NONE` (a check, not a configuration).
@@ -441,6 +455,28 @@ impl<'a> Visitor for Collector<'a> {
         // not just the recorded fields.
         let is_excluded_compile =
             fa == "compile" && (is_re_compile(&node) || is_sqlalchemy_compile(&node));
+        let anchor = node.start();
+        let data_taint = self.taint.classify(
+            anchor,
+            node.args
+                .iter()
+                .chain(node.keywords.iter().map(|kw| &kw.value)),
+        );
+        let command_taint = self.taint.classify(
+            anchor,
+            node.args.iter().chain(
+                node.keywords
+                    .iter()
+                    .filter(|kw| kw.arg.as_ref().is_some_and(|a| a == "args" || a == "cmd"))
+                    .map(|kw| &kw.value),
+            ),
+        );
+        let first_arg_taint = node.args.first().map(|a| self.taint.classify(anchor, [a]));
+        let receiver_taint = match node.func.as_ref() {
+            Expr::Attribute(a) => Some(self.taint.classify(anchor, [a.value.as_ref()])),
+            _ => None,
+        };
+        let first_arg_sql_shape = node.args.first().and_then(sql_shape);
 
         self.out.calls.push(CallRec {
             line,
@@ -461,6 +497,11 @@ impl<'a> Visitor for Collector<'a> {
             first_arg_call_full_attr,
             is_excluded_compile,
             allow_pickle_kw_line,
+            data_taint,
+            command_taint,
+            first_arg_taint,
+            receiver_taint,
+            first_arg_sql_shape,
         });
         self.generic_visit_expr_call(node);
     }
@@ -616,27 +657,32 @@ impl<'a> Visitor for Collector<'a> {
     fn visit_expr_bin_op(&mut self, node: ExprBinOp) {
         if matches!(node.op, Operator::Add | Operator::Mod) {
             let sides = [node.left.as_ref(), node.right.as_ref()];
-            if sides.iter().any(|s| is_crlf_const(s))
-                && sides.iter().any(|s| !matches!(s, Expr::Constant(_)))
-            {
+            let data: Vec<&Expr> = sides
+                .iter()
+                .copied()
+                .filter(|s| !matches!(s, Expr::Constant(_)))
+                .collect();
+            if sides.iter().any(|s| is_crlf_const(s)) && !data.is_empty() {
+                let taint = self.taint.classify(node.start(), data);
                 self.out
-                    .crlf_combo_lines
-                    .push(self.li.line_number(node.start()));
+                    .crlf_combos
+                    .push((self.li.line_number(node.start()), taint));
             }
         }
         self.generic_visit_expr_bin_op(node);
     }
 
     fn visit_expr_joined_str(&mut self, node: ExprJoinedStr) {
-        if node.values.iter().any(is_crlf_const)
-            && node
-                .values
-                .iter()
-                .any(|v| matches!(v, Expr::FormattedValue(_)))
-        {
+        let data: Vec<&Expr> = node
+            .values
+            .iter()
+            .filter(|v| matches!(v, Expr::FormattedValue(_)))
+            .collect();
+        if node.values.iter().any(is_crlf_const) && !data.is_empty() {
+            let taint = self.taint.classify(node.start(), data);
             self.out
-                .crlf_combo_lines
-                .push(self.li.line_number(node.start()));
+                .crlf_combos
+                .push((self.li.line_number(node.start()), taint));
         }
         self.generic_visit_expr_joined_str(node);
     }
@@ -689,9 +735,10 @@ impl<'a> Visitor for Collector<'a> {
     }
 }
 
-fn collect(tree: &ModModule, li: &LineIndex) -> Collected {
+fn collect(tree: &ModModule, li: &LineIndex, taint: &TaintIndex) -> Collected {
     let mut collector = Collector {
         li,
+        taint,
         out: Collected::default(),
         compare_operand_starts: HashSet::new(),
     };
@@ -712,6 +759,7 @@ fn collect(tree: &ModModule, li: &LineIndex) -> Collected {
 pub struct ParsedFile {
     pub module: ModModule,
     li: LineIndex,
+    taint: OnceCell<TaintIndex>,
     collected: OnceCell<Collected>,
     scoped: OnceCell<Vec<ScopedCall>>,
 }
@@ -721,6 +769,7 @@ impl ParsedFile {
         Self {
             module,
             li: LineIndex::new(source),
+            taint: OnceCell::new(),
             collected: OnceCell::new(),
             scoped: OnceCell::new(),
         }
@@ -735,10 +784,15 @@ impl ParsedFile {
         &self.li
     }
 
+    /// Per-scope name bindings for `crate::taint` classification.
+    pub fn taint(&self) -> &TaintIndex {
+        self.taint.get_or_init(|| TaintIndex::build(&self.module))
+    }
+
     /// The `Collector`'s record tables (calls, handlers, defs, ...).
     pub fn collected(&self) -> &Collected {
         self.collected
-            .get_or_init(|| collect(&self.module, &self.li))
+            .get_or_init(|| collect(&self.module, &self.li, self.taint()))
     }
 
     /// Every call with its enclosing scope's parameters, literal bindings
