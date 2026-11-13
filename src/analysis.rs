@@ -538,7 +538,18 @@ impl<'a> Visitor for Collector<'a> {
             Expr::Attribute(a) => Some(self.taint.classify(anchor, [a.value.as_ref()])),
             _ => None,
         };
-        let first_arg_sql_shape = node.args.first().and_then(sql_shape);
+        // Mirrors `ast_checks._sql_shape_at`: look through a local name to
+        // the values assigned to it (`q = "..." % x; execute(q)`).
+        let first_arg_sql_shape = node.args.first().and_then(|a| {
+            sql_shape(a).or_else(|| match a {
+                Expr::Name(n) => self
+                    .taint
+                    .bound_values(anchor, n.id.as_str())
+                    .iter()
+                    .find_map(sql_shape),
+                _ => None,
+            })
+        });
         let mut str_fragments = Vec::new();
         for a in node
             .args

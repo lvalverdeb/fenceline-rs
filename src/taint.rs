@@ -665,6 +665,16 @@ impl TaintIndex {
             _ => Taint::Internal,
         }
     }
+
+    /// Every expression assigned to `name` in the scope of the sink node
+    /// starting at `anchor`; empty when the scope is unknown or the name is
+    /// never assigned there -- mirrors `taint.bound_values`.
+    pub fn bound_values(&self, anchor: TextSize, name: &str) -> &[Expr] {
+        match self.at.get(&anchor) {
+            Some(Some(scope)) => scope.assigns.get(name).map(Vec::as_slice).unwrap_or(&[]),
+            _ => &[],
+        }
+    }
 }
 
 fn source_chain(dotted: &str) -> bool {
