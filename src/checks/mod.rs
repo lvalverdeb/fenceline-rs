@@ -70,7 +70,7 @@ pub fn checks() -> Vec<Check> {
         ),
         check!("XXE (CWE-611)", check_xxe, CodeOnly),
         check!("SSRF (CWE-918)", check_ssrf, Raw),
-        check!("Insecure Temp File (CWE-377)", check_tempfile, CodeOnly),
+        check!("Insecure Temp File (CWE-377)", check_tempfile, Raw),
         check!("Symlink Following (CWE-61)", check_symlink, CodeOnly),
         check!("ReDoS (CWE-1333)", check_redos, Raw),
         check!(

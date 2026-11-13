@@ -1,4 +1,4 @@
 try:
     risky()
-except ValueError:
+except Exception:
     pass

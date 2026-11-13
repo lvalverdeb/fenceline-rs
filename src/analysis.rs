@@ -208,6 +208,7 @@ pub struct CallRec {
 pub struct ExceptRec {
     pub line: usize,
     pub is_bare: bool,
+    /// The handler names `Exception`/`BaseException`, alone or in a tuple.
     pub is_exception_name: bool,
     pub single_pass: bool,
     pub single_continue: bool,
@@ -272,6 +273,9 @@ pub struct Collected {
     /// `(line, text)` for every string literal of 16+ characters, for the
     /// value-shaped credential check.
     pub long_str_literals: Vec<(usize, String)>,
+    /// Lines holding a string literal that is, or is under, a shared temporary
+    /// directory (`/tmp`, `/var/tmp`, `/dev/shm`).
+    pub shared_tmp_path_lines: Vec<usize>,
 }
 
 struct Collector<'a> {
@@ -381,6 +385,10 @@ fn params_from_arguments(
             (a.def.arg.to_string(), is_true, default_line)
         })
         .collect()
+}
+
+fn is_catch_all_name(e: &Expr) -> bool {
+    matches!(e, Expr::Name(n) if n.id.as_str() == "Exception" || n.id.as_str() == "BaseException")
 }
 
 fn str_const(e: &Expr) -> Option<String> {
@@ -592,8 +600,11 @@ impl<'a> Visitor for Collector<'a> {
     fn visit_excepthandler_except_handler(&mut self, node: ExceptHandlerExceptHandler) {
         let line = self.li.line_number(node.start());
         let is_bare = node.type_.is_none();
-        let is_exception_name =
-            matches!(node.type_.as_deref(), Some(Expr::Name(n)) if n.id.as_str() == "Exception");
+        let is_exception_name = match node.type_.as_deref() {
+            Some(Expr::Tuple(t)) => t.elts.iter().any(is_catch_all_name),
+            Some(e) => is_catch_all_name(e),
+            None => false,
+        };
         let single_pass = node.body.len() == 1 && matches!(node.body[0], Stmt::Pass(_));
         let single_continue = node.body.len() == 1 && matches!(node.body[0], Stmt::Continue(_));
         let has_diagnostic =
@@ -716,6 +727,15 @@ impl<'a> Visitor for Collector<'a> {
                 self.out
                     .long_str_literals
                     .push((self.li.line_number(node.start()), s.to_string()));
+            }
+            if ["/tmp/", "/var/tmp/", "/dev/shm/"]
+                .iter()
+                .any(|p| s.starts_with(p))
+                || ["/tmp", "/var/tmp", "/dev/shm"].contains(&s.as_str())
+            {
+                self.out
+                    .shared_tmp_path_lines
+                    .push(self.li.line_number(node.start()));
             }
         }
         self.generic_visit_expr_constant(node);

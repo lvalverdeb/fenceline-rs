@@ -112,6 +112,10 @@ const RANDOM_UNSAFE_FNS: &[&str] = &[
     "shuffle",
     "sample",
     "randrange",
+    "choices",
+    "triangular",
+    "getrandbits",
+    "randbytes",
 ];
 
 pub fn check_insecure_random(
@@ -319,7 +323,11 @@ pub fn check_except_pass(
     let Some(tree) = tree else { return vec![] };
     let collected = tree.collected();
     let mut results = Vec::new();
-    for e in &collected.excepts {
+    for e in collected
+        .excepts
+        .iter()
+        .filter(|e| e.is_bare || e.is_exception_name)
+    {
         if e.single_pass {
             results.push(Finding {
                 cwe_id: "CWE-391",
@@ -1335,18 +1343,21 @@ pub fn check_resource_limits(
         .iter()
         .filter(|c| !c.func_is_bare_name && c.call_name == "read" && !c.has_args)
         .filter(|c| !STREAMING_CONTEXT_RE.is_match(&code_at(lines, c.line)))
-        .map(|c| {
-            ast_finding(
+        .filter_map(|c| {
+            let (confidence, note) = confidence_for(c.receiver_taint.unwrap_or(Taint::Internal))?;
+            Some(ast_finding(
                 "CWE-770",
                 "Unbounded Resource Allocation",
                 Severity::Info,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 c.line,
-                "Unbounded .read() — may exhaust memory on large inputs. Use .read(n) or streaming.".to_string(),
+                format!(
+                    "Unbounded .read() — may exhaust memory on large inputs. Use .read(n) or streaming.{note}"
+                ),
                 "CWE-770 entered Top 25 at #25 in 2025.",
-            )
+            ))
         })
         .collect()
 }
@@ -2034,6 +2045,54 @@ pub fn check_hardcoded_tokens(
                 *line,
                 format!("{description} — plaintext credential in source code."),
                 "Hardcoded cloud API keys are the #1 initial-access vector in supply-chain attacks. Attackers scan public repos for these patterns.",
+            ));
+        }
+    }
+    results
+}
+
+// ── check_tempfile (CWE-377) -- mirrors the Python AST version ─────────────
+
+pub fn check_tempfile(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    let mut results = Vec::new();
+    for c in collected
+        .calls
+        .iter()
+        .filter(|c| c.full_attr == "tempfile.mktemp")
+    {
+        results.push(ast_finding(
+            "CWE-377",
+            "Insecure Temporary File",
+            Severity::High,
+            Confidence::High,
+            pk,
+            lines,
+            c.line,
+            "tempfile.mktemp() is insecure (TOCTOU race). Use TemporaryFile or NamedTemporaryFile."
+                .to_string(),
+            "",
+        ));
+    }
+    let mut seen: HashSet<usize> = HashSet::new();
+    for line in &collected.shared_tmp_path_lines {
+        if seen.insert(*line) {
+            results.push(ast_finding(
+                "CWE-377",
+                "Insecure Temporary File",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                *line,
+                "Hardcoded path under a shared temporary directory — predictable name any local user can pre-create or symlink. Use the tempfile module.".to_string(),
+                "",
             ));
         }
     }

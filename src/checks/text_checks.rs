@@ -120,31 +120,6 @@ pub fn check_xxe(_path: &Path, pk: &str, lines: Lines, tree: Option<&ParsedFile>
     results
 }
 
-// ── check_tempfile (CWE-377) ─────────────────────────────────────────────
-
-pub fn check_tempfile(
-    _path: &Path,
-    pk: &str,
-    lines: Lines,
-    _tree: Option<&ParsedFile>,
-) -> Vec<Finding> {
-    let mut results = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
-        }
-        if line.contains("tempfile.mktemp") {
-            results.push(finding(
-                "CWE-377", "Insecure Temporary File", Severity::High, Confidence::default(),
-                pk, i + 1, line.trim(),
-                "tempfile.mktemp() is insecure (TOCTOU race). Use TemporaryFile or NamedTemporaryFile.".to_string(),
-                "",
-            ));
-        }
-    }
-    results
-}
-
 // ── check_symlink (CWE-61) ───────────────────────────────────────────────
 
 pub fn check_symlink(
