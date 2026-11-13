@@ -1,6 +1,8 @@
 //! Workspace-root discovery, the path-security sandbox check, and
 //! dependency-manifest filenames -- mirrors `fenceline/config.py`.
 
+use crate::models::Severity;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Dependency-manifest filenames probed alongside each package's source tree
@@ -39,6 +41,57 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
         candidate = dir.parent().map(PathBuf::from);
     }
     None
+}
+
+/// `[tool.fenceline.severity]` from the nearest `pyproject.toml` at or above
+/// `start` that carries a `[tool.fenceline]` table, as check function name
+/// -> severity cap; empty when no such file exists. Mirrors
+/// `config.load_severity_policy` plus the CLI's level validation (check
+/// names are validated by the caller against the registry).
+///
+/// A per-repository, reviewable way to say "for this codebase, CRLF
+/// construction is MEDIUM, not HIGH", keeping `--fail-on high` meaningful
+/// without `# nosec`-ing every occurrence or dropping the check. The table
+/// caps, never raises. A typo is an error, not a silently inert line.
+pub fn load_severity_policy(start: &Path) -> Result<BTreeMap<String, Severity>, String> {
+    let mut candidate = Some(start.to_path_buf());
+    while let Some(dir) = candidate {
+        let pyproject = dir.join("pyproject.toml");
+        if pyproject.is_file()
+            && let Ok(text) = std::fs::read_to_string(&pyproject)
+            && let Ok(value) = text.parse::<toml::Table>()
+            && let Some(tool) = value.get("tool").and_then(|t| t.get("fenceline"))
+        {
+            let Some(table) = tool.get("severity") else {
+                return Ok(BTreeMap::new());
+            };
+            let Some(table) = table.as_table() else {
+                return Err(format!(
+                    "{}: [tool.fenceline.severity] must map check names to severity strings",
+                    pyproject.display()
+                ));
+            };
+            let mut policy = BTreeMap::new();
+            for (name, level) in table {
+                let Some(level) = level.as_str() else {
+                    return Err(format!(
+                        "{}: [tool.fenceline.severity] must map check names to severity strings",
+                        pyproject.display()
+                    ));
+                };
+                let Some(sev) = Severity::parse(level) else {
+                    return Err(format!(
+                        "[tool.fenceline.severity]: {name} = '{}' is not one of critical, high, medium, low, info",
+                        level.to_ascii_lowercase()
+                    ));
+                };
+                policy.insert(name.clone(), sev);
+            }
+            return Ok(policy);
+        }
+        candidate = dir.parent().map(PathBuf::from);
+    }
+    Ok(BTreeMap::new())
 }
 
 /// Mirrors `boti.core.is_secure_path`: verifies *target* resolves inside one
@@ -122,5 +175,41 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         assert!(!is_secure_path(other.path(), &[tmp.path()]));
+    }
+
+    #[test]
+    fn load_severity_policy_reads_nearest_tool_fenceline_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.fenceline.severity]\ncheck_crlf = \"medium\"\ncheck_ssrf = \"LOW\"\n",
+        )
+        .unwrap();
+        let nested = tmp.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let policy = load_severity_policy(&nested).unwrap();
+        assert_eq!(policy["check_crlf"], Severity::Medium);
+        assert_eq!(policy["check_ssrf"], Severity::Low);
+    }
+
+    #[test]
+    fn load_severity_policy_rejects_unknown_level_and_is_empty_without_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+        assert!(load_severity_policy(tmp.path()).unwrap().is_empty());
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.fenceline.severity]\ncheck_pickle = \"severe\"\n",
+        )
+        .unwrap();
+        assert!(
+            load_severity_policy(tmp.path())
+                .unwrap_err()
+                .contains("severe")
+        );
     }
 }

@@ -97,6 +97,26 @@ pub fn full_attr(func: &Expr) -> String {
     parts.join(".")
 }
 
+/// `name` as the whole dotted path or its tail -- mirrors
+/// `ast_helpers._dotted_matches` (`pkg.pickle.loads` counts as
+/// `pickle.loads`; `cloudpickle.loads` does not).
+pub fn dotted_matches(dotted: &str, name: &str) -> bool {
+    dotted == name || dotted.ends_with(&format!(".{name}"))
+}
+
+/// `dotted` with its first segment replaced by what the file's imports bind
+/// it to -- `p.loads` is `pickle.loads` after `import pickle as p`, `loads` is
+/// `pickle.loads` after `from pickle import loads`. Mirrors
+/// `ast_helpers._resolve_dotted`.
+pub fn resolve_dotted(dotted: &str, aliases: &HashMap<String, String>) -> String {
+    let (head, rest) = dotted.split_once('.').unwrap_or((dotted, ""));
+    match aliases.get(head) {
+        Some(target) if rest.is_empty() => target.clone(),
+        Some(target) => format!("{target}.{rest}"),
+        None => dotted.to_string(),
+    }
+}
+
 pub fn is_re_compile(node: &ExprCall) -> bool {
     let name = full_attr(&node.func);
     if name == "re.compile" {

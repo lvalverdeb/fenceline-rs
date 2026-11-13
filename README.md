@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`fenceline`](https://github.com/lval
 
 The [Python original](https://github.com/lvalverdeb/fenceline) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/fenceline/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk uncovered and matched along the way (some quite subtle — e.g. `check_assert_security`'s `\b(is|==|!=|in)\b` provably never matching `==`/`!=` written the normal way with spaces or quotes around them).
 
-**Status**: all 57 checks ported (14 AST-based, 41 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 47 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
+**Status**: all 57 checks ported (37 AST-based, 18 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 59 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
 
 ## Why It Exists
 
@@ -65,6 +65,26 @@ other = "../other/src/other"
 ## Severity vs. confidence
 
 Every finding carries two independent ratings: **severity** is how bad it would be if the finding is real; **confidence** is how sure the check is that it *is* real. An AST-based check that matched a real call node is `HIGH` confidence; a text-based check that can't fully rule out a docstring or string-literal mention is `MEDIUM`/`LOW`. Use `--confidence-min medium` to cut noise from the fuzzier checks without raising your severity bar.
+
+## Severity policy
+
+A `[tool.fenceline.severity]` table in the nearest `pyproject.toml` (searched upward from the directory fenceline runs in) caps a check's severity by check function name, same as the Python original:
+
+```toml
+[tool.fenceline.severity]
+check_crlf = "medium"      # we build HTTP framing by hand; CRLF here is by design
+check_ssrf = "low"         # outbound URLs come from our own config, never a request
+```
+
+A cap never raises: an INFO finding from a capped check stays INFO. This keeps `--fail-on high` meaningful without `# nosec`-ing every occurrence or dropping the check, and the policy is a reviewable file in the repository. A misspelled check name or level is an error (exit 2), not a silently inert line.
+
+## Files that could not be parsed
+
+A Python file that fails to parse still gets the line-regex checks, but none of the AST checks. The report says so rather than passing the file off as clean: the text report prints a `could not be parsed` line, and the JSON payload carries a `skipped_files` list.
+
+## Dependency CVEs and lockfiles
+
+`check_dependency_cve` compares the version a project will actually install against the same `vuln_deps.json` table the Python original ships (a curated zero-day watchlist, not an advisory-database mirror; run `pip-audit` for full CVE coverage). When a lockfile (`uv.lock`, `poetry.lock`, `Pipfile.lock`) sits next to the manifest, the lockfile's exact versions are checked and the manifest's ranges are ignored, with the finding reported on the lockfile line. Without a lockfile, an `==` pin below the fixed version is HIGH confidence and a lower bound (`>=`, `~=`) below it is MEDIUM. Version comparison follows PEP 440.
 
 ## Inline suppression
 

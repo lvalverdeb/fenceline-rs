@@ -1,10 +1,3 @@
 {
-  "findings": [
-    {
-      "cwe_id": "CWE-93",
-      "severity": "HIGH",
-      "confidence": "MEDIUM",
-      "line": 1
-    }
-  ]
+  "findings": []
 }

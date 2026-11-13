@@ -43,8 +43,33 @@ struct ReportPayload<'a> {
     nosec_suppressed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     test_suppressed: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_files: Vec<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suppression_hint: Option<&'static str>,
+}
+
+/// One line naming the Python files that failed to parse -- mirrors
+/// `reporting._print_skipped`. The regex checks still ran on them, the AST
+/// checks did not; a reader deciding whether a clean report means anything
+/// needs to know which files it doesn't cover.
+fn print_skipped(skipped_files: &[String]) {
+    if skipped_files.is_empty() {
+        return;
+    }
+    let mut shown = skipped_files
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if skipped_files.len() > 5 {
+        shown.push_str(&format!(", +{} more", skipped_files.len() - 5));
+    }
+    println!(
+        "  ({} file(s) could not be parsed — AST checks did not run on them: {shown})",
+        skipped_files.len()
+    );
 }
 
 // Real-world feedback: a reader who only ever looks at --json output has no
@@ -68,6 +93,7 @@ pub fn print_report(
     baseline_suppressed: usize,
     nosec_suppressed: usize,
     test_suppressed: usize,
+    skipped_files: &[String],
 ) {
     if json_output {
         let payload = ReportPayload {
@@ -90,6 +116,7 @@ pub fn print_report(
             baseline_suppressed: (baseline_suppressed > 0).then_some(baseline_suppressed),
             nosec_suppressed: (nosec_suppressed > 0).then_some(nosec_suppressed),
             test_suppressed: (test_suppressed > 0).then_some(test_suppressed),
+            skipped_files: skipped_files.iter().map(String::as_str).collect(),
             suppression_hint: suppression_hint(
                 !all_findings.is_empty(),
                 baseline_suppressed,
@@ -114,6 +141,7 @@ pub fn print_report(
                 "  ({test_suppressed} finding(s) in test code suppressed — see --include-tests)"
             );
         }
+        print_skipped(skipped_files);
         println!("  {}", "=".repeat(72));
         println!();
         return;
@@ -134,6 +162,7 @@ pub fn print_report(
     if test_suppressed > 0 {
         println!("  ({test_suppressed} finding(s) in test code suppressed — see --include-tests)");
     }
+    print_skipped(skipped_files);
     println!("  {}\n", "=".repeat(72));
 
     for f in all_findings.iter() {
@@ -335,6 +364,7 @@ mod tests {
             baseline_suppressed: None,
             nosec_suppressed: None,
             test_suppressed: None,
+            skipped_files: vec![],
             suppression_hint: None,
         };
         let serialized = serde_json::to_string(&payload).unwrap();
@@ -342,6 +372,7 @@ mod tests {
         assert!(!serialized.contains("nosec_suppressed"));
         assert!(!serialized.contains("test_suppressed"));
         assert!(!serialized.contains("suppression_hint"));
+        assert!(!serialized.contains("skipped_files"));
     }
 
     #[test]
@@ -352,12 +383,14 @@ mod tests {
             baseline_suppressed: Some(3),
             nosec_suppressed: Some(2),
             test_suppressed: Some(1),
+            skipped_files: vec!["pkg/broken.py"],
             suppression_hint: None,
         };
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(serialized.contains("\"baseline_suppressed\":3"));
         assert!(serialized.contains("\"nosec_suppressed\":2"));
         assert!(serialized.contains("\"test_suppressed\":1"));
+        assert!(serialized.contains("\"skipped_files\":[\"pkg/broken.py\"]"));
     }
 
     #[test]

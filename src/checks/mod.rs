@@ -6,15 +6,15 @@ pub mod ast_checks;
 pub mod manifest_checks;
 pub mod text_checks;
 
+use crate::analysis::ParsedFile;
 use crate::models::Finding;
-use rustpython_ast::ModModule;
 use std::path::Path;
 
 /// `(path, package-relative-path, lines, parsed AST or None)` -> findings.
 /// Matches Python's `(path, lines, tree) -> list[Finding]` shape, plus an
 /// already-computed relative path string (`pk` in the Python original, but
 /// computed once per file here rather than once per check call).
-pub type CheckFn = fn(&Path, &str, &[String], Option<&ModModule>) -> Vec<Finding>;
+pub type CheckFn = fn(&Path, &str, &[String], Option<&ParsedFile>) -> Vec<Finding>;
 
 /// Which view of the file a check scans -- mirrors
 /// `checks/__init__.py::lines_for`. Line-regex checks can't tell code from
@@ -57,15 +57,11 @@ pub fn checks() -> Vec<Check> {
     use text_checks::*;
 
     vec![
-        check!("Pickle Deserialization (CWE-502)", check_pickle, CodeOnly),
+        check!("Pickle Deserialization (CWE-502)", check_pickle, Raw),
         check!("eval/exec/compile Injection (CWE-94)", check_eval_exec, Raw),
-        check!(
-            "Command Injection (CWE-78)",
-            check_command_injection,
-            CodeOnly
-        ),
-        check!("SQL Injection (CWE-89)", check_sql_injection, CodeOnly),
-        check!("Path Traversal (CWE-22)", check_path_traversal, CodeOnly),
+        check!("Command Injection (CWE-78)", check_command_injection, Raw),
+        check!("SQL Injection (CWE-89)", check_sql_injection, Raw),
+        check!("Path Traversal (CWE-22)", check_path_traversal, Raw),
         check!(
             "Hardcoded Secrets (CWE-798)",
             check_hardcoded_secrets,
@@ -74,13 +70,13 @@ pub fn checks() -> Vec<Check> {
         check!(
             "YAML Unsafe Deserialization (CWE-502)",
             check_yaml_deserialize,
-            CodeOnly
+            Raw
         ),
         check!("XXE (CWE-611)", check_xxe, CodeOnly),
-        check!("SSRF (CWE-918)", check_ssrf, CodeOnly),
+        check!("SSRF (CWE-918)", check_ssrf, Raw),
         check!("Insecure Temp File (CWE-377)", check_tempfile, CodeOnly),
         check!("Symlink Following (CWE-61)", check_symlink, CodeOnly),
-        check!("ReDoS (CWE-1333)", check_redos, CodeOnly),
+        check!("ReDoS (CWE-1333)", check_redos, Raw),
         check!(
             "Assert Security (CWE-617/670)",
             check_assert_security,
@@ -89,14 +85,14 @@ pub fn checks() -> Vec<Check> {
         check!(
             "exec_driver_sql Safety (CWE-89)",
             check_exec_driver_sql,
-            CodeOnly
+            Raw
         ),
         check!(
             "Supply Chain Dep Confusion (CWE-1104)",
             check_supply_chain,
             CodeOnly
         ),
-        check!("Active Debug Code (CWE-489)", check_debug_mode, CodeOnly),
+        check!("Active Debug Code (CWE-489)", check_debug_mode, Raw),
         check!(
             "Insufficient Logging (CWE-778)",
             check_insufficient_logging,
@@ -109,24 +105,20 @@ pub fn checks() -> Vec<Check> {
             CodeOnly
         ),
         check!("NUL Byte Injection (CWE-158)", check_null_byte, CodeOnly),
-        check!("Resource Limits (CWE-770)", check_resource_limits, CodeOnly),
+        check!("Resource Limits (CWE-770)", check_resource_limits, Raw),
         check!("Insecure Random (CWE-338)", check_insecure_random, Raw),
-        check!("SSTI (CWE-1336)", check_ssti, CodeOnly),
-        check!("CRLF Injection (CWE-93)", check_crlf, CodeOnly),
+        check!("SSTI (CWE-1336)", check_ssti, Raw),
+        check!("CRLF Injection (CWE-93)", check_crlf, Raw),
         check!("LDAP Injection (CWE-90)", check_ldap, CodeOnly),
-        check!("Weak Hash (CWE-328)", check_weak_hash, CodeOnly),
-        check!("Open Redirect (CWE-601)", check_open_redirect, CodeOnly),
+        check!("Weak Hash (CWE-328)", check_weak_hash, Raw),
+        check!("Open Redirect (CWE-601)", check_open_redirect, Raw),
         check!("Log Injection (CWE-117)", check_log_injection, CodeOnly),
         check!("Format String (CWE-134)", check_format_string, Raw),
-        check!(
-            "Arbitrary File Write (CWE-73)",
-            check_arbitrary_write,
-            CodeOnly
-        ),
+        check!("Arbitrary File Write (CWE-73)", check_arbitrary_write, Raw),
         check!("Insecure Default (CWE-453)", check_insecure_default, Raw),
         check!("Log Secrets (CWE-532)", check_log_secrets, CodeOnly),
-        check!("Disabled TLS Verify (CWE-295)", check_tls_verify, CodeOnly),
-        check!("ZipSlip / TarSlip (CWE-22)", check_zipslip, CodeOnly),
+        check!("Disabled TLS Verify (CWE-295)", check_tls_verify, Raw),
+        check!("ZipSlip / TarSlip (CWE-22)", check_zipslip, Raw),
         check!(
             "Hardcoded API Keys (CWE-798)",
             check_hardcoded_tokens,
@@ -153,21 +145,13 @@ pub fn checks() -> Vec<Check> {
             Raw
         ),
         check!("numpy.load allow_pickle (CWE-502)", check_numpy_load, Raw),
-        check!(
-            "pandas.read_pickle (CWE-502)",
-            check_pandas_pickle,
-            CodeOnly
-        ),
+        check!("pandas.read_pickle (CWE-502)", check_pandas_pickle, Raw),
         check!(
             "numpy.load library injection (CWE-114)",
             check_numpy_load_lib,
             CodeOnly
         ),
-        check!(
-            "pandas.read_xml XXE (CWE-611)",
-            check_pandas_xml_xxe,
-            CodeOnly
-        ),
+        check!("pandas.read_xml XXE (CWE-611)", check_pandas_xml_xxe, Raw),
         check!(
             ".pth Startup Hooks (CWE-829 / T1546.018)",
             check_pth_startup_hooks,
@@ -186,7 +170,7 @@ pub fn checks() -> Vec<Check> {
         check!(
             "ML Model File Loading (OWASP ML06 / CWE-502)",
             check_model_file_load,
-            CodeOnly
+            Raw
         ),
         check!(
             "Decode-then-Execute Chains (CWE-94)",
@@ -196,17 +180,17 @@ pub fn checks() -> Vec<Check> {
         check!(
             "Binding to All Interfaces (CWE-1327)",
             check_bind_all_interfaces,
-            CodeOnly
+            Raw
         ),
         check!(
             "Weak TLS Protocol Version (CWE-326)",
             check_weak_tls_version,
-            CodeOnly
+            Raw
         ),
         check!(
             "Legacy PyCrypto Import (CWE-1104)",
             check_legacy_pycrypto,
-            CodeOnly
+            Raw
         ),
         check!(
             "HuggingFace Unsafe Download (OWASP ML06 / B615)",

@@ -1,15 +1,16 @@
 //! CLI argument parsing and the top-level scan pipeline -- mirrors
 //! `fenceline/cli.py`.
 
+use crate::analysis::ParsedFile;
 use crate::baseline::{load_baseline, split_by_baseline, write_baseline};
 use crate::checks::LineView;
 use crate::checks::checks;
-use crate::config::{DEP_MANIFEST_FILES, find_workspace_root, is_secure_path};
+use crate::config::{
+    DEP_MANIFEST_FILES, find_workspace_root, is_secure_path, load_severity_policy,
+};
 use crate::models::{Confidence, Finding, Severity};
 use crate::reporting::print_report;
-use crate::scanner::{
-    is_test_path, iter_py, mask_non_code, parse_source, read_source, rel, split_lines,
-};
+use crate::scanner::{is_test_path, iter_py, mask_non_code, read_source, rel, split_lines};
 use crate::suppression::apply_suppressions;
 use clap::{Parser, ValueEnum};
 use std::collections::BTreeMap;
@@ -470,6 +471,20 @@ pub fn run(args: &Args) -> i32 {
     }
 
     let all_checks = checks();
+    let severity_policy = match load_severity_policy(&cwd) {
+        Ok(policy) => policy,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return 2;
+        }
+    };
+    if let Some(unknown) = severity_policy
+        .keys()
+        .find(|name| !all_checks.iter().any(|c| c.fn_name == name.as_str()))
+    {
+        eprintln!("error: [tool.fenceline.severity]: unknown check '{unknown}'");
+        return 2;
+    }
 
     let mut path_package: BTreeMap<PathBuf, String> = BTreeMap::new();
     for (name, root) in &packages {
@@ -502,17 +517,24 @@ pub fn run(args: &Args) -> i32 {
 
     let mut all_findings: Vec<Finding> = Vec::new();
     let mut nosec_suppressed = 0usize;
+    // Python files that failed to parse: the regex checks still ran on them,
+    // the AST checks did not, and the report says so rather than passing
+    // them off as clean.
+    let mut skipped_files: Vec<String> = Vec::new();
 
     for (path, pkg_name) in &path_package {
         let source = read_source(path);
         let lines = split_lines(&source);
         let tree = if path.extension().is_some_and(|e| e == "py") {
-            parse_source(&source, path)
+            ParsedFile::parse(&source, path)
         } else {
             None
         };
-        let code_lines = mask_non_code(path, &source, tree.as_ref());
+        let code_lines = mask_non_code(path, &source, tree.as_ref().map(|t| &t.module));
         let pk = rel(path, workspace_root.as_deref());
+        if path.extension().is_some_and(|e| e == "py") && tree.is_none() {
+            skipped_files.push(pk.clone());
+        }
 
         let mut file_findings = Vec::new();
         for check in &all_checks {
@@ -520,8 +542,12 @@ pub fn run(args: &Args) -> i32 {
                 LineView::CodeOnly => &code_lines,
                 LineView::Raw => &lines,
             };
+            let cap = severity_policy.get(check.fn_name).copied();
             for mut f in (check.run)(path, &pk, view, tree.as_ref()) {
                 f.package = pkg_name.clone();
+                if let Some(cap) = cap {
+                    f.severity = f.severity.capped(cap);
+                }
                 file_findings.push(f);
             }
         }
@@ -563,6 +589,7 @@ pub fn run(args: &Args) -> i32 {
             0,
             nosec_suppressed,
             test_suppressed,
+            &skipped_files,
         );
         if !args.quiet && !args.json {
             println!(
@@ -598,6 +625,7 @@ pub fn run(args: &Args) -> i32 {
         baseline_suppressed,
         nosec_suppressed,
         test_suppressed,
+        &skipped_files,
     );
 
     let threshold = args.fail_on.severity();

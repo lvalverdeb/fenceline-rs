@@ -1,406 +1,19 @@
 //! AST-based check functions -- mirrors `fenceline/checks/ast_checks.py`.
 //!
-//! A single `Collector` Visitor walks the whole module once, recording
-//! every `Call`/`ExceptHandler`/`FunctionDef`/`Assign`/`AnnAssign` node's
-//! relevant fields; each check function below filters/maps over the
-//! collected records rather than re-walking the tree itself. This design
-//! (and the four walk-fix overrides it depends on) was validated in the
-//! Phase 0 parser spike against real Python output before being used here.
+//! Each check filters/maps over the record tables `analysis::ParsedFile`
+//! builds once per file (see that module) rather than walking the tree
+//! itself.
 
+use crate::analysis::ParsedFile;
 use crate::ast_helpers::{
-    LineIndex, full_attr, has_dynamic_arg, is_re_compile, is_sqlalchemy_compile, skip,
-    walk_arguments_children, walk_comprehension_children, walk_keyword_children,
-    walk_withitem_children,
+    call_name, dotted_matches, full_attr, is_locally_safe_expr, resolve_dotted, skip,
 };
 use crate::models::{Confidence, Finding, Severity};
-use regex::Regex;
-use rustpython_ast::{
-    Arguments, Comprehension, Constant, ExceptHandlerExceptHandler, Expr, ExprCall, Keyword,
-    ModModule, Ranged, Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef, StmtClassDef,
-    StmtFunctionDef, Visitor, WithItem,
-};
+use regex::{Regex, RegexBuilder};
+use rustpython_ast::{Expr, ExprCall, Operator, Ranged};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
-
-fn is_true_constant(e: &Expr) -> bool {
-    matches!(e, Expr::Constant(c) if matches!(c.value, Constant::Bool(true)))
-}
-
-fn target_is_allow_pickle(target: &Expr) -> bool {
-    match target {
-        Expr::Name(n) => n.id.as_str() == "allow_pickle",
-        Expr::Attribute(a) => a.attr.as_str() == "allow_pickle",
-        _ => false,
-    }
-}
-
-/// Dotted name for a bare `Name`/`Attribute` chain, e.g. `pydantic.BaseModel`
-/// -> `"pydantic.BaseModel"` -- mirrors `full_attr`, but for a general
-/// expression (a class base) rather than specifically a `Call`'s `.func`.
-/// Empty string for anything else (a subscript, a call, ...).
-fn expr_dotted_name(node: &Expr) -> String {
-    let mut parts = Vec::new();
-    let mut cur = node;
-    loop {
-        match cur {
-            Expr::Attribute(a) => {
-                parts.push(a.attr.as_str());
-                cur = &a.value;
-            }
-            Expr::Name(n) => {
-                parts.push(n.id.as_str());
-                parts.reverse();
-                return parts.join(".");
-            }
-            _ => return String::new(),
-        }
-    }
-}
-
-fn is_pydantic_base(node: &Expr) -> bool {
-    let name = expr_dotted_name(node);
-    name == "BaseModel" || name.ends_with(".BaseModel")
-}
-
-/// Pydantic's BaseModel is used for internal config/settings objects just
-/// as often as for network-facing request bodies -- an unbounded str field
-/// on a config class isn't a real attack surface. Narrowing to conventional
-/// request/input-DTO name suffixes (matching FastAPI community convention)
-/// keeps the signal-to-noise ratio usable rather than flagging every
-/// settings class in a codebase. Mirrors
-/// `ast_checks.py::_looks_like_request_model`.
-const REQUEST_MODEL_SUFFIXES: &[&str] = &["Request", "Input", "Payload", "Body", "Params"];
-
-fn looks_like_request_model(class_name: &str) -> bool {
-    REQUEST_MODEL_SUFFIXES
-        .iter()
-        .any(|s| class_name.ends_with(s))
-}
-
-/// `"str"`/`"bytes"` if *annotation* is a bare, `Optional`-wrapped,
-/// `| None`-wrapped, or `Annotated`-wrapped `str`/`bytes` type; `None`
-/// otherwise -- mirrors `ast_checks.py::_str_or_bytes_base_type`.
-fn str_or_bytes_base_type(annotation: &Expr) -> Option<&'static str> {
-    match annotation {
-        Expr::Name(n) if n.id.as_str() == "str" => Some("str"),
-        Expr::Name(n) if n.id.as_str() == "bytes" => Some("bytes"),
-        Expr::Subscript(sub) => {
-            let Expr::Name(base) = sub.value.as_ref() else {
-                return None;
-            };
-            if base.id.as_str() == "Optional"
-                && let Expr::Name(inner) = sub.slice.as_ref()
-            {
-                return match inner.id.as_str() {
-                    "str" => Some("str"),
-                    "bytes" => Some("bytes"),
-                    _ => None,
-                };
-            }
-            if base.id.as_str() == "Annotated"
-                && let Expr::Tuple(tup) = sub.slice.as_ref()
-                && let Some(Expr::Name(first)) = tup.elts.first()
-            {
-                return match first.id.as_str() {
-                    "str" => Some("str"),
-                    "bytes" => Some("bytes"),
-                    _ => None,
-                };
-            }
-            None
-        }
-        Expr::BinOp(bin) if matches!(bin.op, rustpython_ast::Operator::BitOr) => {
-            for side in [bin.left.as_ref(), bin.right.as_ref()] {
-                if let Expr::Name(n) = side {
-                    match n.id.as_str() {
-                        "str" => return Some("str"),
-                        "bytes" => return Some("bytes"),
-                        _ => {}
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn field_call_has_max_length(node: &Expr) -> bool {
-    let Expr::Call(call) = node else { return false };
-    let name = full_attr(&call.func);
-    (name == "Field" || name == "StringConstraints")
-        && call
-            .keywords
-            .iter()
-            .any(|kw| kw.arg.as_ref().is_some_and(|a| a.as_str() == "max_length"))
-}
-
-fn has_length_constraint(annotation: &Expr, default: Option<&Expr>) -> bool {
-    if let Some(value) = default
-        && field_call_has_max_length(value)
-    {
-        return true;
-    }
-    if let Expr::Subscript(sub) = annotation
-        && let Expr::Name(base) = sub.value.as_ref()
-        && base.id.as_str() == "Annotated"
-        && let Expr::Tuple(tup) = sub.slice.as_ref()
-    {
-        return tup.elts.iter().skip(1).any(field_call_has_max_length);
-    }
-    false
-}
-
-struct CallRec {
-    line: usize,
-    full_attr: String,
-    func_is_bare_name: bool,
-    args_dynamic: bool,
-    keyword_names: Vec<String>,
-    keyword_true_names: Vec<String>,
-    first_arg_call_full_attr: Option<String>,
-    /// Only meaningful when `full_attr == "compile"`: true if this is
-    /// `re.compile(...)` or a SQLAlchemy-style `.compile()` -- both
-    /// excluded from `check_eval_exec`'s bare-`compile()` rule.
-    is_excluded_compile: bool,
-    /// Line of the `allow_pickle=True` keyword's own *value* node, if
-    /// present -- mirrors `ast_checks.py::_allow_pickle_kw_line`, which
-    /// deliberately reports the value's line rather than the call's own
-    /// (opening-paren) line, so a multi-line call flags the line the
-    /// dangerous keyword actually sits on.
-    allow_pickle_kw_line: Option<usize>,
-}
-
-struct ExceptRec {
-    line: usize,
-    is_bare: bool,
-    is_exception_name: bool,
-    single_pass: bool,
-    single_continue: bool,
-    has_diagnostic: bool,
-}
-
-struct FuncDefRec {
-    line: usize,
-    name: String,
-    is_plain_function_def: bool,
-    /// `(param name, is-default-True, default's own line)` -- the third
-    /// field mirrors `ast_checks.py::_allow_pickle_default_lines`, which
-    /// reports the default value's own line rather than the `def`
-    /// statement's line, so a multi-line signature flags the line the
-    /// dangerous default actually sits on.
-    params: Vec<(String, Option<bool>, Option<usize>)>,
-}
-
-struct AssignRec {
-    line: usize,
-    is_allow_pickle_true: bool,
-}
-
-struct PydanticFieldRec {
-    line: usize,
-    field_name: String,
-    base_type: &'static str,
-    has_constraint: bool,
-}
-
-#[derive(Default)]
-struct Collected {
-    calls: Vec<CallRec>,
-    excepts: Vec<ExceptRec>,
-    funcdefs: Vec<FuncDefRec>,
-    assigns: Vec<AssignRec>,
-    ann_assigns: Vec<AssignRec>,
-    pydantic_fields: Vec<PydanticFieldRec>,
-}
-
-struct Collector<'a> {
-    li: &'a LineIndex,
-    out: Collected,
-}
-
-fn params_from_arguments(
-    args: &Arguments,
-    li: &LineIndex,
-) -> Vec<(String, Option<bool>, Option<usize>)> {
-    args.posonlyargs
-        .iter()
-        .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter())
-        .map(|a| {
-            let is_true = a.default.as_deref().map(is_true_constant);
-            let default_line = a.default.as_deref().map(|d| li.line_number(d.start()));
-            (a.def.arg.to_string(), is_true, default_line)
-        })
-        .collect()
-}
-
-impl<'a> Visitor for Collector<'a> {
-    fn visit_expr_call(&mut self, node: ExprCall) {
-        let line = self.li.line_number(node.start());
-        let fa = full_attr(&node.func);
-        let func_is_bare_name = matches!(node.func.as_ref(), Expr::Name(_));
-        let args_dynamic = has_dynamic_arg(&node);
-        let keyword_names: Vec<String> = node
-            .keywords
-            .iter()
-            .filter_map(|kw| kw.arg.as_ref().map(|a| a.to_string()))
-            .collect();
-        let keyword_true_names: Vec<String> = node
-            .keywords
-            .iter()
-            .filter(|kw| is_true_constant(&kw.value))
-            .filter_map(|kw| kw.arg.as_ref().map(|a| a.to_string()))
-            .collect();
-        let allow_pickle_kw_line = node
-            .keywords
-            .iter()
-            .find(|kw| {
-                kw.arg
-                    .as_ref()
-                    .is_some_and(|a| a.as_str() == "allow_pickle")
-                    && is_true_constant(&kw.value)
-            })
-            .map(|kw| self.li.line_number(kw.value.start()));
-        let first_arg_call_full_attr = node.args.first().and_then(|a| {
-            if let Expr::Call(c) = a {
-                Some(full_attr(&c.func))
-            } else {
-                None
-            }
-        });
-        // Needed by check_eval_exec (re.compile/sqlalchemy .compile()
-        // exclusion) -- computed here since it needs the *whole* Call node,
-        // not just the recorded fields.
-        let is_excluded_compile =
-            fa == "compile" && (is_re_compile(&node) || is_sqlalchemy_compile(&node));
-
-        self.out.calls.push(CallRec {
-            line,
-            full_attr: fa,
-            func_is_bare_name,
-            args_dynamic,
-            keyword_names,
-            keyword_true_names,
-            first_arg_call_full_attr,
-            is_excluded_compile,
-            allow_pickle_kw_line,
-        });
-        self.generic_visit_expr_call(node);
-    }
-
-    fn visit_excepthandler_except_handler(&mut self, node: ExceptHandlerExceptHandler) {
-        let line = self.li.line_number(node.start());
-        let is_bare = node.type_.is_none();
-        let is_exception_name =
-            matches!(node.type_.as_deref(), Some(Expr::Name(n)) if n.id.as_str() == "Exception");
-        let single_pass = node.body.len() == 1 && matches!(node.body[0], Stmt::Pass(_));
-        let single_continue = node.body.len() == 1 && matches!(node.body[0], Stmt::Continue(_));
-        let has_diagnostic =
-            crate::ast_helpers::handler_has_diagnostic(&node.body, node.name.as_deref());
-        self.out.excepts.push(ExceptRec {
-            line,
-            is_bare,
-            is_exception_name,
-            single_pass,
-            single_continue,
-            has_diagnostic,
-        });
-        self.generic_visit_excepthandler_except_handler(node);
-    }
-
-    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
-        let line = self.li.line_number(node.start());
-        self.out.funcdefs.push(FuncDefRec {
-            line,
-            name: node.name.to_string(),
-            is_plain_function_def: true,
-            params: params_from_arguments(&node.args, self.li),
-        });
-        self.generic_visit_stmt_function_def(node);
-    }
-
-    fn visit_stmt_async_function_def(&mut self, node: StmtAsyncFunctionDef) {
-        let line = self.li.line_number(node.start());
-        self.out.funcdefs.push(FuncDefRec {
-            line,
-            name: node.name.to_string(),
-            is_plain_function_def: false,
-            params: params_from_arguments(&node.args, self.li),
-        });
-        self.generic_visit_stmt_async_function_def(node);
-    }
-
-    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
-        if looks_like_request_model(node.name.as_str()) && node.bases.iter().any(is_pydantic_base) {
-            for stmt in &node.body {
-                if let Stmt::AnnAssign(ann) = stmt
-                    && let Expr::Name(target) = ann.target.as_ref()
-                    && let Some(base_type) = str_or_bytes_base_type(&ann.annotation)
-                {
-                    let has_constraint =
-                        has_length_constraint(&ann.annotation, ann.value.as_deref());
-                    self.out.pydantic_fields.push(PydanticFieldRec {
-                        line: self.li.line_number(ann.start()),
-                        field_name: target.id.to_string(),
-                        base_type,
-                        has_constraint,
-                    });
-                }
-            }
-        }
-        self.generic_visit_stmt_class_def(node);
-    }
-
-    fn visit_stmt_assign(&mut self, node: StmtAssign) {
-        let line = self.li.line_number(node.start());
-        if node.targets.iter().any(target_is_allow_pickle) {
-            self.out.assigns.push(AssignRec {
-                line,
-                is_allow_pickle_true: is_true_constant(&node.value),
-            });
-        }
-        self.generic_visit_stmt_assign(node);
-    }
-
-    fn visit_stmt_ann_assign(&mut self, node: StmtAnnAssign) {
-        let line = self.li.line_number(node.start());
-        if target_is_allow_pickle(&node.target)
-            && let Some(value) = node.value.as_deref()
-        {
-            self.out.ann_assigns.push(AssignRec {
-                line,
-                is_allow_pickle_true: is_true_constant(value),
-            });
-        }
-        self.generic_visit_stmt_ann_assign(node);
-    }
-
-    fn visit_arguments(&mut self, node: Arguments) {
-        walk_arguments_children(self, node);
-    }
-    fn visit_comprehension(&mut self, node: Comprehension) {
-        walk_comprehension_children(self, node);
-    }
-    fn visit_keyword(&mut self, node: Keyword) {
-        walk_keyword_children(self, node);
-    }
-    fn visit_withitem(&mut self, node: WithItem) {
-        walk_withitem_children(self, node);
-    }
-}
-
-fn collect(tree: &ModModule, source: &str) -> Collected {
-    let li = LineIndex::new(source);
-    let mut collector = Collector {
-        li: &li,
-        out: Collected::default(),
-    };
-    for stmt in tree.body.clone() {
-        collector.visit_stmt(stmt);
-    }
-    collector.out
-}
 
 fn code_at(lines: &[String], line: usize) -> String {
     lines
@@ -415,11 +28,10 @@ pub fn check_eval_exec(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     let mut results = Vec::new();
     for call in &collected.calls {
         match call.full_attr.as_str() {
@@ -473,11 +85,10 @@ pub fn check_insufficient_logging(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     collected
         .excepts
         .iter()
@@ -514,11 +125,10 @@ pub fn check_insecure_random(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     collected
         .calls
         .iter()
@@ -554,11 +164,10 @@ pub fn check_format_string(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     collected
         .calls
         .iter()
@@ -603,11 +212,10 @@ pub fn check_insecure_default(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     let mut flagged_lines: Vec<usize> = Vec::new();
 
     for call in &collected.calls {
@@ -644,11 +252,10 @@ pub fn check_request_timeout(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     collected
         .calls
         .iter()
@@ -685,11 +292,10 @@ pub fn check_torch_load(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     collected
         .calls
         .iter()
@@ -715,11 +321,10 @@ pub fn check_except_pass(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     let mut results = Vec::new();
     for e in &collected.excepts {
         if e.single_pass {
@@ -761,11 +366,10 @@ pub fn check_pandas_eval(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     let mut results = Vec::new();
     for c in &collected.calls {
         if c.full_attr == "pandas.eval" || c.full_attr == "pd.eval" {
@@ -809,11 +413,10 @@ pub fn check_numpy_load(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     collected
         .calls
         .iter()
@@ -847,12 +450,11 @@ pub fn check_parquet_arrow_deserialize(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let mut results = Vec::new();
     if let Some(tree) = tree {
-        let source = lines.join("\n");
-        let collected = collect(tree, &source);
+        let collected = tree.collected();
         for f in &collected.funcdefs {
             if f.is_plain_function_def && f.name == "__arrow_ext_deserialize__" {
                 results.push(Finding {
@@ -918,7 +520,7 @@ pub fn check_decode_exec_chains(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let mut results = Vec::new();
 
@@ -961,8 +563,7 @@ pub fn check_decode_exec_chains(
 
     // AST-based detection for same-line patterns.
     if let Some(tree) = tree {
-        let source = lines.join("\n");
-        let collected = collect(tree, &source);
+        let collected = tree.collected();
         for c in &collected.calls {
             if c.func_is_bare_name
                 && (c.full_attr == "exec" || c.full_attr == "eval")
@@ -995,11 +596,10 @@ pub fn check_huggingface_unsafe_download(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
     let mut results = Vec::new();
     for c in &collected.calls {
         // Recover the bare call name the way check_name() would (last
@@ -1056,11 +656,10 @@ pub fn check_unbounded_pydantic_field(
     _path: &Path,
     pk: &str,
     lines: &[String],
-    tree: Option<&ModModule>,
+    tree: Option<&ParsedFile>,
 ) -> Vec<Finding> {
     let Some(tree) = tree else { return vec![] };
-    let source = lines.join("\n");
-    let collected = collect(tree, &source);
+    let collected = tree.collected();
 
     collected
         .pydantic_fields
@@ -1080,6 +679,1068 @@ pub fn check_unbounded_pydantic_field(
                 f.field_name, f.base_type
             ),
             zero_day_relevance: "OWASP API4:2023: Unrestricted Resource Consumption — unbounded request fields are a common DoS vector in FastAPI/Pydantic APIs.",
+        })
+        .collect()
+}
+
+// ── Converted from line-regex checks (Phase 2) ────────────────────────────
+//
+// Mirrors the same block in `ast_checks.py`: each of these used to regex a
+// line of source. Matching the AST means a quoted mention can't match,
+// `pkg.pickle.loads(...)` is recognised while `cloudpickle.loads(...)` is
+// kept distinct, keywords are inspected rather than pattern-matched, and a
+// call with only literal arguments can be told apart from one fed data.
+
+#[allow(clippy::too_many_arguments)]
+fn ast_finding(
+    cwe_id: &'static str,
+    cwe_name: &'static str,
+    severity: Severity,
+    confidence: Confidence,
+    pk: &str,
+    lines: &[String],
+    line: usize,
+    description: String,
+    zero_day_relevance: &'static str,
+) -> Finding {
+    Finding {
+        cwe_id,
+        cwe_name,
+        severity,
+        confidence,
+        package: String::new(),
+        file: pk.to_string(),
+        line,
+        code_snippet: code_at(lines, line),
+        description,
+        zero_day_relevance,
+    }
+}
+
+const PICKLE_ZERO_DAY: &str = "CVE-2026-56315 picklescan <1.0.4 bypass (uuid, imaplib etc. unblocked); \
+CVE-2026-0763 GPT Academic CVSS 9.8; LangChain CVE-2025-68664 SSTI+pickle chain";
+
+const PICKLE_CALLS: &[(&str, &str, Severity)] = &[
+    (
+        "pickle.loads",
+        "pickle.loads() / pickle.load()",
+        Severity::Critical,
+    ),
+    (
+        "pickle.load",
+        "pickle.loads() / pickle.load()",
+        Severity::Critical,
+    ),
+    ("pickle.Unpickler", "pickle.Unpickler()", Severity::Critical),
+    (
+        "cloudpickle.loads",
+        "cloudpickle.loads() / cloudpickle.load()",
+        Severity::Critical,
+    ),
+    (
+        "cloudpickle.load",
+        "cloudpickle.loads() / cloudpickle.load()",
+        Severity::Critical,
+    ),
+    (
+        "dill.loads",
+        "dill.loads() / dill.load()",
+        Severity::Critical,
+    ),
+    (
+        "dill.load",
+        "dill.loads() / dill.load()",
+        Severity::Critical,
+    ),
+    ("joblib.load", "joblib.load()", Severity::High),
+    ("shelve.open", "shelve.open()", Severity::High),
+    (
+        "marshal.loads",
+        "marshal.loads() / marshal.load()",
+        Severity::High,
+    ),
+    (
+        "marshal.load",
+        "marshal.loads() / marshal.load()",
+        Severity::High,
+    ),
+];
+
+pub fn check_pickle(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    let mut results = Vec::new();
+    for call in &collected.calls {
+        if let Some((_, label, sev)) = PICKLE_CALLS
+            .iter()
+            .find(|(name, _, _)| dotted_matches(&call.full_attr, name))
+        {
+            results.push(ast_finding(
+                "CWE-502",
+                "Deserialization of Untrusted Data",
+                *sev,
+                Confidence::High,
+                pk,
+                lines,
+                call.line,
+                format!("Unsafe deserialisation via {label}. Allows arbitrary code execution."),
+                PICKLE_ZERO_DAY,
+            ));
+        }
+    }
+    results
+}
+
+const COMMAND_CALLS: &[(&str, Severity)] = &[
+    ("os.system", Severity::Critical),
+    ("os.popen", Severity::Critical),
+    ("subprocess.call", Severity::High),
+    ("subprocess.Popen", Severity::High),
+    ("subprocess.run", Severity::High),
+    ("subprocess.check_output", Severity::High),
+    ("subprocess.getoutput", Severity::High),
+    ("subprocess.getstatusoutput", Severity::High),
+    ("os.execv", Severity::High),
+    ("os.execl", Severity::High),
+    ("os.execve", Severity::High),
+    ("os.execvp", Severity::High),
+    ("pty.spawn", Severity::High),
+    ("asyncio.create_subprocess_shell", Severity::High),
+];
+
+pub fn check_command_injection(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    let mut results = Vec::new();
+    for call in &collected.calls {
+        if let Some((name, sev)) = COMMAND_CALLS
+            .iter()
+            .find(|(name, _)| dotted_matches(&call.full_attr, name))
+        {
+            results.push(ast_finding(
+                "CWE-78",
+                "OS Command Injection",
+                *sev,
+                Confidence::High,
+                pk,
+                lines,
+                call.line,
+                format!("{name}() spawns subprocesses; may allow command injection if arguments are unvalidated."),
+                "CWE-78: 20 CVEs in KEV. Still a top Python zero-day vector.",
+            ));
+        }
+        if call.keyword_true_names.iter().any(|k| k == "shell") {
+            results.push(ast_finding(
+                "CWE-78",
+                "OS Command Injection",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                call.line,
+                "shell=True enables shell injection in subprocess calls.".to_string(),
+                "",
+            ));
+        }
+    }
+    results
+}
+
+pub fn check_yaml_deserialize(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    let mut results = Vec::new();
+    for call in &collected.calls {
+        let flagged = if dotted_matches(&call.full_attr, "yaml.load") {
+            !call
+                .arg_dotted_names
+                .iter()
+                .any(|d| d.contains("SafeLoader"))
+        } else {
+            dotted_matches(&call.full_attr, "yaml.unsafe_load")
+        };
+        if flagged {
+            results.push(ast_finding(
+                "CWE-502",
+                "Deserialization of Untrusted Data",
+                Severity::Critical,
+                Confidence::High,
+                pk,
+                lines,
+                call.line,
+                "yaml.load()/yaml.unsafe_load() without SafeLoader — enables arbitrary code execution.".to_string(),
+                "CVE-2026-24009: Docling RCE via PyYAML shadow vulnerability. \
+Transitive YAML deps can introduce RCE without a direct yaml import.",
+            ));
+        }
+    }
+    results
+}
+
+pub fn check_ssti(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    collected
+        .calls
+        .iter()
+        .filter(|c| c.call_name == "Template" && c.args_dynamic)
+        .map(|c| {
+            ast_finding(
+                "CWE-1336",
+                "Server-Side Template Injection",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "Template instantiation — SSTI if template string is user-controlled.".to_string(),
+                "CVE-2025-68664: LangChain Core SSTI zero-day chaining deserialisation + Jinja2 for RCE.",
+            )
+        })
+        .collect()
+}
+
+pub fn check_crlf(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    let mut hit_lines: Vec<usize> = collected.crlf_combo_lines.clone();
+    hit_lines.extend(
+        collected
+            .calls
+            .iter()
+            .filter(|c| c.is_crlf_format_call)
+            .map(|c| c.line),
+    );
+    hit_lines.sort_unstable();
+    hit_lines.dedup();
+    hit_lines
+        .into_iter()
+        .map(|line| {
+            ast_finding(
+                "CWE-93",
+                "CRLF Injection",
+                Severity::High,
+                Confidence::Medium,
+                pk,
+                lines,
+                line,
+                "CRLF sequence combined with non-literal data — may enable HTTP response splitting / log injection.".to_string(),
+                "",
+            )
+        })
+        .collect()
+}
+
+const WEAK_HASH_NAMES: &[&str] = &["md5", "md4", "md2", "sha1"];
+
+pub fn check_weak_hash(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    let mut results = Vec::new();
+    for call in &collected.calls {
+        if call
+            .keyword_false_names
+            .iter()
+            .any(|k| k == "usedforsecurity")
+        {
+            continue;
+        }
+        let fa = call.full_attr.as_str();
+        if dotted_matches(fa, "hashlib.md5") || dotted_matches(fa, "hashlib.sha1") {
+            results.push(ast_finding(
+                "CWE-328",
+                "Weak Cryptographic Hash",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                call.line,
+                "Use of MD5/SHA-1 — collision-prone, use SHA-256 or better.".to_string(),
+                "",
+            ));
+        } else if dotted_matches(fa, "hashlib.new")
+            && call
+                .first_arg_str
+                .as_deref()
+                .is_some_and(|a| WEAK_HASH_NAMES.contains(&a.to_ascii_lowercase().as_str()))
+        {
+            results.push(ast_finding(
+                "CWE-328",
+                "Weak Cryptographic Hash",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                call.line,
+                "hashlib.new() with a weak algorithm name (MD5/MD4/MD2/SHA-1) — \
+same collision risk as calling hashlib.md5()/sha1() directly, \
+just reached through the generic constructor. Use SHA-256 or better."
+                    .to_string(),
+                "",
+            ));
+        }
+    }
+    results
+}
+
+pub fn check_open_redirect(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    collected
+        .calls
+        .iter()
+        .filter(|c| (c.call_name == "redirect" || c.call_name == "Redirect") && c.args_dynamic)
+        .map(|c| {
+            ast_finding(
+                "CWE-601",
+                "Open Redirect",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "URL redirect — ensure destination is validated against an allowlist.".to_string(),
+                "",
+            )
+        })
+        .collect()
+}
+
+const TLS_ZERO_DAY: &str = "CWE-295 is #8 in CWE Top 25. TLS bypass zero-days (e.g. CVE-2026-27834 Python \
+CERT_NONE in urllib) enable MITM on every connection.";
+
+pub fn check_tls_verify(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    // (line, description) in source order, first description per line wins --
+    // mirrors the Python version's walk order closely enough that the
+    // conformance corpus (which compares line/severity/confidence, not
+    // message text) can't tell them apart.
+    let mut hits: Vec<(usize, &'static str)> = Vec::new();
+    for call in &collected.calls {
+        if call.keyword_false_names.iter().any(|k| k == "verify") {
+            hits.push((
+                call.line,
+                "HTTP/S3 client with verify=False — TLS certificate validation disabled.",
+            ));
+        }
+        if call
+            .keyword_false_names
+            .iter()
+            .any(|k| k == "check_hostname")
+        {
+            hits.push((
+                call.line,
+                "Hostname verification disabled — no TLS identity check.",
+            ));
+        }
+        if call.call_name == "_create_unverified_context" {
+            hits.push((
+                call.line,
+                "ssl._create_unverified_context() — creates unverified TLS context.",
+            ));
+        }
+    }
+    for &(line, ref name, value) in &collected.bool_assigns {
+        if name == "check_hostname" && !value {
+            hits.push((
+                line,
+                "Hostname verification disabled — no TLS identity check.",
+            ));
+        }
+    }
+    for &(line, in_compare) in &collected.cert_none_refs {
+        if !in_compare {
+            hits.push((
+                line,
+                "ssl.CERT_NONE — peer certificate not verified, man-in-the-middle possible.",
+            ));
+        }
+    }
+    hits.sort_by_key(|(line, _)| *line);
+    let mut seen = HashSet::new();
+    hits.into_iter()
+        .filter(|(line, _)| seen.insert(*line))
+        .map(|(line, desc)| {
+            ast_finding(
+                "CWE-295",
+                "Improper Certificate Validation",
+                Severity::Critical,
+                Confidence::High,
+                pk,
+                lines,
+                line,
+                desc.to_string(),
+                TLS_ZERO_DAY,
+            )
+        })
+        .collect()
+}
+
+// ── Phase 2, second increment ─────────────────────────────────────────────
+
+fn all_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Constant(_) => true,
+        Expr::BinOp(b) => all_constant(&b.left) && all_constant(&b.right),
+        _ => false,
+    }
+}
+
+/// `"f-string"` for an f-string with at least one interpolation,
+/// `"concatenation"` for `+`/`%` on a non-literal or `"...".format(x)`, else
+/// `None` -- the three ways a query gets data spliced into it. Mirrors
+/// `ast_checks._sql_shape`.
+fn sql_shape(arg: &Expr) -> Option<&'static str> {
+    match arg {
+        Expr::JoinedStr(j) => j
+            .values
+            .iter()
+            .any(|v| matches!(v, Expr::FormattedValue(_)))
+            .then_some("f-string"),
+        Expr::BinOp(b) if matches!(b.op, Operator::Add | Operator::Mod) => {
+            (!all_constant(arg)).then_some("concatenation")
+        }
+        Expr::Call(c) => (matches!(
+            c.func.as_ref(),
+            Expr::Attribute(a) if a.attr.as_str() == "format" && matches!(a.value.as_ref(), Expr::Constant(_))
+        ) && (!c.args.is_empty() || !c.keywords.is_empty()))
+            .then_some("concatenation"),
+        _ => None,
+    }
+}
+
+const SQL_EXEC_METHOD_NAMES: &[&str] = &["execute", "exec_driver_sql"];
+
+pub fn check_sql_injection(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let li = tree.line_index();
+    let mut results = Vec::new();
+    for scoped in tree.scoped_calls() {
+        let name = call_name(&scoped.call);
+        if !SQL_EXEC_METHOD_NAMES.contains(&name.as_str()) {
+            continue;
+        }
+        let Some(arg) = scoped.call.args.first() else {
+            continue;
+        };
+        let Some(shape) = sql_shape(arg) else {
+            continue;
+        };
+        if is_locally_safe_expr(arg, &scoped.params, &scoped.literals, &scoped.imports, 0) {
+            continue;
+        }
+        let desc = if shape == "f-string" {
+            format!("f-string in {name}() — probable SQL injection")
+        } else {
+            format!("String concatenation or %-formatting in {name}() — probable SQL injection")
+        };
+        results.push(ast_finding(
+            "CWE-89",
+            "SQL Injection",
+            Severity::Critical,
+            Confidence::High,
+            pk,
+            lines,
+            li.line_number(scoped.call.start()),
+            desc,
+            "CWE-89 rose to #2 in 2025 Top 25. Most exploited injection class after XSS.",
+        ));
+    }
+    results
+}
+
+pub fn check_exec_driver_sql(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let li = tree.line_index();
+    let mut results = Vec::new();
+    for scoped in tree.scoped_calls() {
+        if call_name(&scoped.call) != "exec_driver_sql" {
+            continue;
+        }
+        let Some(arg) = scoped.call.args.first() else {
+            continue;
+        };
+        if sql_shape(arg) != Some("f-string")
+            || is_locally_safe_expr(arg, &scoped.params, &scoped.literals, &scoped.imports, 0)
+        {
+            continue;
+        }
+        results.push(ast_finding(
+            "CWE-89",
+            "SQL Injection",
+            Severity::Critical,
+            Confidence::High,
+            pk,
+            lines,
+            li.line_number(scoped.call.start()),
+            "exec_driver_sql() with f-string — direct SQL injection.".to_string(),
+            "",
+        ));
+    }
+    results
+}
+
+const SSRF_METHOD_NAMES: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "request",
+];
+const SSRF_SESSION_CONSTRUCTORS: &[&str] = &[
+    "requests.Session",
+    "httpx.Client",
+    "httpx.AsyncClient",
+    "aiohttp.ClientSession",
+];
+
+fn ssrf_url_arg(call: &ExprCall) -> Option<&Expr> {
+    call.args.first().or_else(|| {
+        call.keywords
+            .iter()
+            .find(|kw| kw.arg.as_ref().is_some_and(|a| a.as_str() == "url"))
+            .map(|kw| &kw.value)
+    })
+}
+
+pub fn check_ssrf(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let li = tree.line_index();
+    let aliases = &tree.collected().aliases;
+    let mut results = Vec::new();
+    for scoped in tree.scoped_calls() {
+        let fa = resolve_dotted(&full_attr(&scoped.call.func), aliases);
+        let method = call_name(&scoped.call);
+        let is_method = SSRF_METHOD_NAMES.contains(&method.as_str());
+        let is_module_call = fa == "urllib.request.urlopen"
+            || (is_method
+                && ["requests", "httpx"]
+                    .iter()
+                    .any(|m| dotted_matches(&fa, &format!("{m}.{method}"))));
+        let mut is_session_call = false;
+        if !is_module_call
+            && is_method
+            && let Expr::Attribute(attr) = scoped.call.func.as_ref()
+            && let Expr::Name(base) = attr.value.as_ref()
+            && let Some(Expr::Call(bound)) = scoped.literals.get(base.id.as_str())
+        {
+            let ctor = resolve_dotted(&full_attr(&bound.func), aliases);
+            is_session_call = SSRF_SESSION_CONSTRUCTORS.contains(&ctor.as_str());
+        }
+        if !(is_module_call || is_session_call) {
+            continue;
+        }
+        let Some(url) = ssrf_url_arg(&scoped.call) else {
+            continue;
+        };
+        if is_locally_safe_expr(url, &scoped.params, &scoped.literals, &scoped.imports, 0) {
+            continue;
+        }
+        results.push(ast_finding(
+            "CWE-918",
+            "Server-Side Request Forgery",
+            Severity::High,
+            Confidence::High,
+            pk,
+            lines,
+            li.line_number(scoped.call.start()),
+            "HTTP request — verify URL is validated against allowlist; SSRF if user-controlled."
+                .to_string(),
+            "CWE-918 fell to #22 but SSRF zero-days (cloud metadata exfiltration) remain critical.",
+        ));
+    }
+    results
+}
+
+static NESTED_QUANTIFIER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\([^)]+[+*?]\)[+*?{]").unwrap());
+const REGEX_COMPILE_CALLS: &[&str] = &["re.compile", "re.match", "re.search"];
+
+pub fn check_redos(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| {
+            REGEX_COMPILE_CALLS
+                .iter()
+                .any(|n| dotted_matches(&c.full_attr, n))
+        })
+        .filter(|c| {
+            c.first_arg_str
+                .as_deref()
+                .is_some_and(|p| NESTED_QUANTIFIER_RE.is_match(p))
+        })
+        .map(|c| {
+            ast_finding(
+                "CWE-1333",
+                "ReDoS (Catastrophic Backtracking)",
+                Severity::Medium,
+                Confidence::Low,
+                pk,
+                lines,
+                c.line,
+                "Nested quantifier pattern — potential ReDoS (catastrophic backtracking)."
+                    .to_string(),
+                "ReDoS zero-days have been used to DoS auth gateways. CWE-1333 new to OWASP 2025.",
+            )
+        })
+        .collect()
+}
+
+static STREAMING_CONTEXT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    RegexBuilder::new(r"chunk|iter_content|stream")
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+});
+
+pub fn check_resource_limits(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| !c.func_is_bare_name && c.call_name == "read" && !c.has_args)
+        .filter(|c| !STREAMING_CONTEXT_RE.is_match(&code_at(lines, c.line)))
+        .map(|c| {
+            ast_finding(
+                "CWE-770",
+                "Unbounded Resource Allocation",
+                Severity::Info,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "Unbounded .read() — may exhaust memory on large inputs. Use .read(n) or streaming.".to_string(),
+                "CWE-770 entered Top 25 at #25 in 2025.",
+            )
+        })
+        .collect()
+}
+
+fn is_file_move_or_copy(fa: &str) -> bool {
+    let (head, tail) = fa.rsplit_once('.').unwrap_or(("", fa));
+    dotted_matches(fa, "shutil.move")
+        || dotted_matches(fa, "os.rename")
+        || (tail.starts_with("copy") && (head == "shutil" || head.ends_with(".shutil")))
+}
+
+pub fn check_arbitrary_write(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| is_file_move_or_copy(&c.full_attr) && c.args_dynamic)
+        .map(|c| {
+            ast_finding(
+                "CWE-73",
+                "External Control of File Name",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "File operation — verify destination path is validated to prevent arbitrary write."
+                    .to_string(),
+                "",
+            )
+        })
+        .collect()
+}
+
+pub fn check_zipslip(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| !c.func_is_bare_name && c.call_name == "extractall")
+        .filter(|c| {
+            c.n_positional < 2 && !c.keyword_names.iter().any(|k| k == "members" || k == "filter")
+        })
+        .map(|c| {
+            ast_finding(
+                "CWE-22",
+                "Path Traversal — ZipSlip / TarSlip",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "extractall() without path traversal guard — an archive with ../ entries can overwrite arbitrary files.".to_string(),
+                "ZipSlip zero-day pattern: path traversal in archive extraction enables RCE via overwritten binaries (CVE-2026-20624 Python tarfile).",
+            )
+        })
+        .collect()
+}
+
+fn is_pandas_fn(fa: &str, name: &str) -> bool {
+    dotted_matches(fa, &format!("pandas.{name}")) || dotted_matches(fa, &format!("pd.{name}"))
+}
+
+pub fn check_pandas_pickle(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| is_pandas_fn(&c.full_attr, "read_pickle"))
+        .map(|c| {
+            ast_finding(
+                "CWE-502",
+                "Deserialization of Untrusted Data (read_pickle)",
+                Severity::Critical,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "pd.read_pickle() deserializes Python objects via pickle — arbitrary code execution if file is untrusted.".to_string(),
+                "Trail of Bits: pandas.read_pickle() uses pickle.load() under the hood — standard pickle RCE.",
+            )
+        })
+        .collect()
+}
+
+pub fn check_pandas_xml_xxe(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| is_pandas_fn(&c.full_attr, "read_xml"))
+        .filter(|c| !c.keyword_names.iter().any(|k| k == "parser"))
+        .map(|c| {
+            ast_finding(
+                "CWE-611",
+                "XXE via pandas.read_xml",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "pd.read_xml() defaults to lxml parser — may be vulnerable to XXE. Use parser='etree' or defusedxml.".to_string(),
+                "Trail of Bits: pandas.read_xml with lxml parser enables XXE attacks on XML data pipelines.",
+            )
+        })
+        .collect()
+}
+
+const TORCH_MODEL_EXTS: &[&str] = &[".pt", ".pth", ".ckpt"];
+const PICKLE_MODEL_EXTS: &[&str] = &[".pt", ".pkl", ".h5", ".joblib", ".ckpt"];
+const PICKLE_LOAD_FAMILY: &[&str] = &[
+    "joblib.load",
+    "pickle.load",
+    "cloudpickle.load",
+    "dill.load",
+];
+const KERAS_LOAD_MODEL: &[&str] = &[
+    "tf.load_model",
+    "tf.models.load_model",
+    "keras.load_model",
+    "keras.models.load_model",
+];
+
+pub fn check_model_file_load(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut results = Vec::new();
+    for c in &tree.collected().calls {
+        let fa = c.full_attr.as_str();
+        if dotted_matches(fa, "torch.load")
+            && c.str_args
+                .iter()
+                .any(|s| TORCH_MODEL_EXTS.iter().any(|e| s.ends_with(e)))
+        {
+            let guarded = c.keyword_names.iter().any(|k| k == "weights_only")
+                && !c.keyword_false_names.iter().any(|k| k == "weights_only");
+            results.push(ast_finding(
+                "CWE-502",
+                "Deserialization of Untrusted Data (ML Model)",
+                if guarded { Severity::Low } else { Severity::Critical },
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                format!(
+                    "torch.load() on model file{}. Prefer SafeTensors format for untrusted model files.",
+                    if guarded { "" } else { " without weights_only=True" }
+                ),
+                "OWASP ML06: pickle-based model formats enable RCE via malicious model files. SafeTensors mitigates this by design.",
+            ));
+        } else if PICKLE_LOAD_FAMILY.iter().any(|n| dotted_matches(fa, n))
+            && let Some(ext) = c
+                .str_args
+                .iter()
+                .find_map(|s| PICKLE_MODEL_EXTS.iter().find(|e| s.ends_with(*e)))
+        {
+            results.push(ast_finding(
+                "CWE-502",
+                "Deserialization of Untrusted Data (ML Model)",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                format!("pickle-based load on {ext} file — arbitrary code execution via malicious model. Prefer SafeTensors for untrusted model files."),
+                "OWASP ML06: 80% of ML supply-chain attacks exploit pickle-based model formats.",
+            ));
+        } else if KERAS_LOAD_MODEL.iter().any(|n| dotted_matches(fa, n)) {
+            results.push(ast_finding(
+                "CWE-502",
+                "Deserialization of Untrusted Data (Keras Model)",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "tf.keras.models.load_model() can deserialize arbitrary Python objects via custom layers/optimizers. Prefer SafeTensors for untrusted models.".to_string(),
+                "OWASP ML06: Keras H5 format carries pickle-like deserialization risk.",
+            ));
+        }
+    }
+    results
+}
+
+pub fn check_path_traversal(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut results = Vec::new();
+    for c in &tree.collected().calls {
+        if c.call_name == "lstrip" && c.first_arg_str.as_deref() == Some("/") {
+            results.push(ast_finding(
+                "CWE-22",
+                "Path Traversal",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "lstrip('/') does NOT prevent ../ traversal — use Path.resolve() + is_relative_to().".to_string(),
+                "CWE-22 is #6 in Top 25 with 10 CVEs in KEV.",
+            ));
+        } else if c.call_name == "open" && c.arg_names.iter().any(|n| n.contains("relative_path")) {
+            results.push(ast_finding(
+                "CWE-22",
+                "Path Traversal",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                c.line,
+                "Variable named 'relative_path' used in open() — verify ../ is rejected with Path.resolve().".to_string(),
+                "",
+            ));
+        }
+    }
+    results
+}
+
+pub fn check_debug_mode(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let collected = tree.collected();
+    let mut hit_lines: Vec<usize> = collected
+        .calls
+        .iter()
+        .filter(|c| c.keyword_true_names.iter().any(|k| k == "debug"))
+        .map(|c| c.line)
+        .collect();
+    hit_lines.extend(
+        collected
+            .bool_assigns
+            .iter()
+            .filter(|(_, name, value)| name == "debug" && *value)
+            .map(|(line, _, _)| *line),
+    );
+    hit_lines.sort_unstable();
+    hit_lines
+        .into_iter()
+        .map(|line| {
+            ast_finding(
+                "CWE-489",
+                "Active Debug Code",
+                Severity::Medium,
+                Confidence::Low,
+                pk,
+                lines,
+                line,
+                "Hardcoded debug=True — may expose sensitive info in production.".to_string(),
+                "",
+            )
+        })
+        .collect()
+}
+
+pub fn check_bind_all_interfaces(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut hit_lines = tree.collected().bind_all_lines.clone();
+    hit_lines.sort_unstable();
+    hit_lines.dedup();
+    hit_lines
+        .into_iter()
+        .map(|line| {
+            ast_finding(
+                "CWE-1327",
+                "Binding to an Unrestricted IP Address",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                line,
+                "Host bound to 0.0.0.0 — listens on every network interface, not just localhost. Bind to 127.0.0.1 unless external access is actually required.".to_string(),
+                "B104: services accidentally exposed on all interfaces are a common initial-access vector once a container/VM's network boundary is misconfigured.",
+            )
+        })
+        .collect()
+}
+
+pub fn check_weak_tls_version(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut seen = HashSet::new();
+    tree.collected()
+        .weak_tls_refs
+        .iter()
+        .filter(|(line, _)| seen.insert(*line))
+        .map(|(line, name)| {
+            ast_finding(
+                "CWE-326",
+                "Inadequate Encryption Strength",
+                Severity::High,
+                Confidence::High,
+                pk,
+                lines,
+                *line,
+                format!("{name} — explicitly requests a deprecated, broken SSL/TLS protocol version. Use ssl.PROTOCOL_TLS_CLIENT/SERVER (or omit ssl_version entirely) to let Python negotiate the strongest mutually-supported version."),
+                "B502/B503/B504: SSLv3 enables POODLE, TLSv1.0/1.1 are formally deprecated by RFC 8996 — still found in legacy integration code talking to old servers.",
+            )
+        })
+        .collect()
+}
+
+pub fn check_legacy_pycrypto(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .import_stmts
+        .iter()
+        .filter(|(_, roots)| roots.iter().any(|r| r == "Crypto"))
+        .map(|(line, _)| {
+            ast_finding(
+                "CWE-1104",
+                "Supply Chain — Unmaintained Dependency",
+                Severity::Medium,
+                Confidence::High,
+                pk,
+                lines,
+                *line,
+                "Imports the old PyCrypto package (unmaintained since 2013, several unpatched CVEs) — migrate to pycryptodome (`import Cryptodome` / `from Cryptodome import ...`), a maintained drop-in replacement.".to_string(),
+                "PyCrypto has no security fixes for over a decade; several known vulnerabilities (e.g. weak RNG seeding in old releases) remain unpatched.",
+            )
         })
         .collect()
 }

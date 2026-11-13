@@ -15,6 +15,25 @@ pub enum Severity {
 }
 
 impl Severity {
+    /// Case-insensitive parse of a severity name, for the
+    /// `[tool.fenceline.severity]` policy table.
+    pub fn parse(text: &str) -> Option<Severity> {
+        match text.to_ascii_uppercase().as_str() {
+            "CRITICAL" => Some(Severity::Critical),
+            "HIGH" => Some(Severity::High),
+            "MEDIUM" => Some(Severity::Medium),
+            "LOW" => Some(Severity::Low),
+            "INFO" => Some(Severity::Info),
+            _ => None,
+        }
+    }
+
+    /// `self` lowered to `cap` when more severe than `cap`; otherwise
+    /// unchanged -- mirrors `models.cap_severity` (a cap, not an override).
+    pub fn capped(self, cap: Severity) -> Severity {
+        if self < cap { cap } else { self }
+    }
+
     /// Upper-case string form -- must match Python's literal severity
     /// strings exactly, since this is what appears in JSON output that a
     /// conformance suite (or an external consumer) diffs against.

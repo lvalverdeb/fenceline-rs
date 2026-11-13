@@ -1,0 +1,16 @@
+{
+  "findings": [
+    {
+      "cwe_id": "CWE-328",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "line": 2
+    },
+    {
+      "cwe_id": "CWE-328",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "line": 3
+    }
+  ]
+}

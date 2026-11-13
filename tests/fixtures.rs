@@ -5,12 +5,13 @@
 //! `confidence`/`line` -- the fields a port must reproduce exactly. Message
 //! text is not compared (allowed to differ, per RUST_PORT_PROPOSAL.md §5).
 
+use fenceline::analysis::ParsedFile;
 use fenceline::checks::{LineView, checks};
 use fenceline::models::{Confidence, Finding, Severity};
-use fenceline::scanner::{mask_non_code, parse_source};
+use fenceline::scanner::mask_non_code;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 struct ExpectedFinding {
@@ -92,16 +93,21 @@ fn fixture_corpus_matches_expected_findings() {
                 .path_name
                 .clone()
                 .unwrap_or_else(|| py_path.file_name().unwrap().to_str().unwrap().to_string());
-            let fake_path = Path::new(&path_name);
+            // A relative label would resolve against the crate root, where a
+            // sibling-lockfile lookup could find real files; anchor it in the
+            // fixture's own directory instead (same intent as the Python
+            // harness's chdir to an empty tmp dir).
+            let fake_path_buf = py_path.with_file_name(&path_name);
+            let fake_path = fake_path_buf.as_path();
 
             let lines: Vec<String> = source.lines().map(str::to_string).collect();
             let tree = if fake_path.extension().and_then(|e| e.to_str()) == Some("py") {
-                parse_source(&source, fake_path)
+                ParsedFile::parse(&source, fake_path)
             } else {
                 None
             };
             // Same dispatch as cli.rs: regex checks see the comment/docstring-masked view.
-            let code_lines = mask_non_code(fake_path, &source, tree.as_ref());
+            let code_lines = mask_non_code(fake_path, &source, tree.as_ref().map(|t| &t.module));
             let view = match check.view {
                 LineView::CodeOnly => &code_lines,
                 LineView::Raw => &lines,

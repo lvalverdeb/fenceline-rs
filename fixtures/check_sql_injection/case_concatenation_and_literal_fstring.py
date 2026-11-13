@@ -1,0 +1,5 @@
+cursor.execute("SELECT * FROM t WHERE id = " + user_id)
+cursor.execute("SELECT * FROM t WHERE id = %s" % user_id)
+cursor.execute("SELECT * FROM t WHERE id = {}".format(uid))
+cursor.execute(f"SELECT 1")
+cursor.execute("SELECT * FROM t WHERE id = %s", (user_id,))
