@@ -104,6 +104,7 @@ pub fn checks() -> Vec<Check> {
         check!("Resource Limits (CWE-770)", check_resource_limits, Raw),
         check!("Insecure Random (CWE-338)", check_insecure_random, Raw),
         check!("SSTI (CWE-1336)", check_ssti, Raw),
+        check!("XSS via mark_safe (CWE-79)", check_unsafe_markup, Raw),
         check!("CRLF Injection (CWE-93)", check_crlf, Raw),
         check!("LDAP Injection (CWE-90)", check_ldap, CodeOnly),
         check!("Weak Hash (CWE-328)", check_weak_hash, Raw),

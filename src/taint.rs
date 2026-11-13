@@ -318,6 +318,9 @@ pub struct ScopeInfo {
     /// Parameters some caller in the package feeds request data (set by
     /// `crate::callers` after every file of the package is parsed).
     caller_params: RefCell<HashSet<String>>,
+    /// The enclosing class is a view/handler class, so `self.kwargs` and
+    /// `self.args` hold URL captures.
+    view_class: bool,
 }
 
 /// Every `Name` inside an assignment target, like `ast.walk(target)` in the
@@ -453,7 +456,29 @@ fn collect_own(stmts: &[Stmt]) -> ScopeCollector {
     collector
 }
 
-fn is_handler(name: &str, decorators: &[Expr], enclosing_class_bases: Option<&[String]>) -> bool {
+fn is_view_class(bases: Option<&[String]>) -> bool {
+    bases.is_some_and(|bases| {
+        bases
+            .iter()
+            .any(|b| HANDLER_BASES.iter().any(|h| b.ends_with(h)))
+    })
+}
+
+/// `self.kwargs` / `self.args` (or a chain on them): the URL captures of a
+/// class-based view -- mirrors `taint._is_view_capture`.
+fn is_view_capture(dotted: &str) -> bool {
+    dotted == "self.kwargs"
+        || dotted == "self.args"
+        || dotted.starts_with("self.kwargs.")
+        || dotted.starts_with("self.args.")
+}
+
+fn is_handler(
+    name: &str,
+    args: &Arguments,
+    decorators: &[Expr],
+    enclosing_class_bases: Option<&[String]>,
+) -> bool {
     for deco in decorators {
         let target = match deco {
             Expr::Call(c) => c.func.as_ref(),
@@ -465,14 +490,17 @@ fn is_handler(name: &str, decorators: &[Expr], enclosing_class_bases: Option<&[S
             return true;
         }
     }
-    if let Some(bases) = enclosing_class_bases
-        && HANDLER_METHODS.contains(&name)
-    {
-        return bases
-            .iter()
-            .any(|b| HANDLER_BASES.iter().any(|h| b.ends_with(h)));
+    if HANDLER_METHODS.contains(&name) && is_view_class(enclosing_class_bases) {
+        return true;
     }
-    false
+    // An AWS Lambda entry point: the event is the request.
+    let positional: Vec<&str> = args
+        .posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .map(|a| a.def.arg.as_str())
+        .collect();
+    positional == ["event", "context"]
 }
 
 fn param_names(args: &Arguments) -> HashSet<String> {
@@ -542,7 +570,8 @@ impl ScopeIndexer {
         body: &[Stmt],
     ) -> Rc<ScopeInfo> {
         let cls = self.enclosing_class();
-        let handler = is_handler(name, decorators, cls.map(|(_, bases)| bases));
+        let bases = cls.map(|(_, bases)| bases);
+        let handler = is_handler(name, args, decorators, bases);
         let own = collect_own(body);
         let mut assigns: HashMap<String, Vec<Expr>> = self
             .module
@@ -562,6 +591,7 @@ impl ScopeIndexer {
             imports,
             cls: cls.map(|(name, _)| name.to_string()),
             caller_params: RefCell::new(HashSet::new()),
+            view_class: is_view_class(bases),
         })
     }
 
@@ -672,6 +702,7 @@ impl TaintIndex {
             imports: own.imports,
             cls: None,
             caller_params: RefCell::new(HashSet::new()),
+            view_class: false,
         });
         let mut indexer = ScopeIndexer {
             module,
@@ -806,6 +837,9 @@ impl<'s> Classifier<'s> {
                 if !dotted.is_empty() && source_chain(&dotted) {
                     return Taint::Source;
                 }
+                if self.scope.view_class && is_view_capture(&dotted) {
+                    return Taint::Source;
+                }
                 if matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self") {
                     return Taint::Internal;
                 }
@@ -814,6 +848,9 @@ impl<'s> Classifier<'s> {
             Expr::Subscript(s) => {
                 let dotted = expr_dotted_name(&s.value);
                 if !dotted.is_empty() && source_chain(&dotted) {
+                    return Taint::Source;
+                }
+                if self.scope.view_class && is_view_capture(&dotted) {
                     return Taint::Source;
                 }
                 self.expr(&s.value, depth + 1)

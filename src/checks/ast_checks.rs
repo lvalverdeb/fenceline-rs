@@ -915,7 +915,7 @@ pub fn check_ssti(
     collected
         .calls
         .iter()
-        .filter(|c| c.call_name == "Template")
+        .filter(|c| c.call_name == "Template" || c.call_name == "from_string")
         .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(
@@ -1028,6 +1028,17 @@ just reached through the generic constructor. Use SHA-256 or better."
     results
 }
 
+/// Flask/Django/aiohttp helpers plus the response classes of Django,
+/// Starlette/FastAPI and aiohttp that take a destination directly.
+const REDIRECT_CALLS: &[&str] = &[
+    "redirect",
+    "Redirect",
+    "HttpResponseRedirect",
+    "HttpResponsePermanentRedirect",
+    "RedirectResponse",
+    "HTTPFound",
+];
+
 pub fn check_open_redirect(
     _path: &Path,
     pk: &str,
@@ -1039,7 +1050,7 @@ pub fn check_open_redirect(
     collected
         .calls
         .iter()
-        .filter(|c| c.call_name == "redirect" || c.call_name == "Redirect")
+        .filter(|c| REDIRECT_CALLS.contains(&c.call_name.as_str()))
         .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(
@@ -1137,7 +1148,8 @@ pub fn check_tls_verify(
 
 // ── Phase 2, second increment ─────────────────────────────────────────────
 
-const SQL_EXEC_METHOD_NAMES: &[&str] = &["execute", "exec_driver_sql"];
+// `raw`/`RawSQL`: Django's escape hatches take the statement verbatim.
+const SQL_EXEC_METHOD_NAMES: &[&str] = &["execute", "exec_driver_sql", "raw", "RawSQL"];
 
 pub fn check_sql_injection(
     _path: &Path,
@@ -1593,6 +1605,15 @@ pub fn check_path_traversal(
                 "Variable named 'relative_path' used in open() — verify ../ is rejected with Path.resolve().",
                 "",
             )
+        } else if c.call_name == "send_file" || c.call_name == "FileResponse" {
+            // Flask's send_file / Starlette's and Django's FileResponse take a
+            // path verbatim (unlike send_from_directory, which safe-joins).
+            (
+                c.data_taint,
+                Severity::High,
+                "File served from a non-literal path — path traversal if the path is request-derived; resolve it and check is_relative_to() first.",
+                "CWE-22 is #6 in Top 25 with 10 CVEs in KEV.",
+            )
         } else {
             continue;
         };
@@ -1612,6 +1633,39 @@ pub fn check_path_traversal(
         ));
     }
     results
+}
+
+/// CWE-79. `mark_safe(...)` (Django) or `Markup(...)` (markupsafe, Flask)
+/// fed a non-literal: both tell the template engine not to escape the
+/// value, so request data inside it is reflected XSS.
+pub fn check_unsafe_markup(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    tree.collected()
+        .calls
+        .iter()
+        .filter(|c| c.call_name == "mark_safe" || c.call_name == "Markup")
+        .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
+        .map(|(c, (confidence, note))| {
+            ast_finding(
+                "CWE-79",
+                "Cross-site Scripting",
+                Severity::High,
+                confidence,
+                pk,
+                lines,
+                c.line,
+                format!(
+                    "mark_safe()/Markup() disables HTML escaping — XSS if the content is user-controlled.{note}"
+                ),
+                "CWE-79 is #1 in the 2025 Top 25.",
+            )
+        })
+        .collect()
 }
 
 pub fn check_debug_mode(
