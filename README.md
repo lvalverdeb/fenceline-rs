@@ -49,7 +49,7 @@ Exit codes: `0` (no findings at or above `--fail-on`), `1` (one or more).
 | `--confidence-min` | `low` | Drop findings below this confidence (`high`\|`medium`\|`low`) |
 | `--baseline PATH` | — | Only report/fail on findings not already present in this baseline |
 | `--write-baseline PATH` | — | Snapshot current findings to PATH and exit 0 |
-| `--include-tests` | off | Include CWE-798/617/918/770 findings inside test code |
+| `--include-tests` | off | Include CWE-798/617/918/770/295 findings inside test code |
 | `--test-paths DIRNAME [DIRNAME ...]` | — | Extra directory names to treat as non-production, alongside the built-in `tests`/`test`/`conftest.py` conventions |
 | `--version` | — | Print the installed fenceline version and exit |
 

@@ -40,7 +40,7 @@ pub const DEFAULT_CWD_EXCLUDES: &[&str] = &[
 /// applicable" often enough that treating it identically to a production
 /// hit drowns out genuine findings in the same category -- mirrors
 /// `cli.py::_TEST_DEPRIORITIZED_CWES`.
-const TEST_DEPRIORITIZED_CWES: &[&str] = &["CWE-798", "CWE-617", "CWE-918", "CWE-770"];
+const TEST_DEPRIORITIZED_CWES: &[&str] = &["CWE-798", "CWE-617", "CWE-918", "CWE-770", "CWE-295"];
 
 const NOISE_DIR_NAMES: &[&str] = &[
     "__pycache__",
@@ -200,7 +200,7 @@ pub struct Args {
     pub confidence_min: ConfidenceMin,
 
     /// Include findings for CWE categories that are usually noise in test code
-    /// (CWE-798, CWE-617, CWE-918, CWE-770) when they occur in a tests/ directory,
+    /// (CWE-798, CWE-617, CWE-918, CWE-770, CWE-295) when they occur in a tests/ directory,
     /// test_*.py/*_test.py file, or conftest.py. Off by default; production
     /// code paths are unaffected either way.
     #[arg(long)]
