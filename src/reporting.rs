@@ -1,7 +1,9 @@
 //! Human-readable and JSON report rendering -- mirrors `fenceline/reporting.py`.
 
-use crate::models::Finding;
+use crate::models::{Finding, Severity};
 use serde::Serialize;
+use serde_json::json;
+use std::collections::{BTreeMap, HashMap};
 
 const RESET: &str = "\x1b[0m";
 
@@ -297,6 +299,122 @@ OWASP ML06     ML model pickle-based formats RCE            (ML supply-chain)
 pydepgate       decode-then-execute chains on PyPI           (supply-chain)
 ";
 
+// ── SARIF 2.1.0 (GitHub code scanning, VS Code SARIF viewer, etc.) ─────────
+// Mirrors `reporting.sarif_report`. Built with `json!`, so object keys come
+// out sorted rather than in the Python insertion order; SARIF consumers do
+// not care, and the parity test compares parsed documents.
+
+/// SARIF has three result levels; fenceline's five severities fold into them.
+fn sarif_level(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical | Severity::High => "error",
+        Severity::Medium => "warning",
+        Severity::Low | Severity::Info => "note",
+    }
+}
+
+/// GitHub reads `security-severity` (0-10) off the rule to label alerts
+/// critical (>= 9.0) / high (>= 7.0) / medium (>= 4.0) / low.
+fn security_severity(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "9.5",
+        Severity::High => "7.5",
+        Severity::Medium => "5.0",
+        Severity::Low => "2.5",
+        Severity::Info => "1.0",
+    }
+}
+
+fn sarif_uri(file: &str) -> String {
+    file.replace('\\', "/")
+}
+
+/// The scan as a SARIF 2.1.0 log: one rule per CWE (its severity is the
+/// highest seen for that CWE), one result per finding in report order,
+/// unparseable files as tool notifications. Suppressed findings are simply
+/// absent; SARIF consumers keep their own suppression state.
+pub fn sarif_report(all_findings: &[Finding], skipped_files: &[String]) -> serde_json::Value {
+    let mut ordered: Vec<&Finding> = all_findings.iter().collect();
+    ordered.sort_by(|a, b| (a.severity, &a.file, a.line).cmp(&(b.severity, &b.file, b.line)));
+    // First in report order = highest severity for that CWE.
+    let mut rules: BTreeMap<&str, &Finding> = BTreeMap::new();
+    for f in &ordered {
+        rules.entry(f.cwe_id).or_insert(f);
+    }
+    let rule_index: HashMap<&str, usize> = rules.keys().enumerate().map(|(i, k)| (*k, i)).collect();
+
+    let rule_objects: Vec<serde_json::Value> = rules
+        .iter()
+        .map(|(cwe, f)| {
+            let number = cwe.rsplit('-').next().unwrap_or(cwe);
+            json!({
+                "id": cwe,
+                "name": f.cwe_name,
+                "shortDescription": {"text": f.cwe_name},
+                "helpUri": format!("https://cwe.mitre.org/data/definitions/{number}.html"),
+                "properties": {"security-severity": security_severity(f.severity), "tags": ["security", cwe]},
+            })
+        })
+        .collect();
+    let results: Vec<serde_json::Value> = ordered
+        .iter()
+        .map(|f| {
+            json!({
+                "ruleId": f.cwe_id,
+                "ruleIndex": rule_index[f.cwe_id],
+                "level": sarif_level(f.severity),
+                "message": {"text": f.description},
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": sarif_uri(&f.file), "uriBaseId": "%SRCROOT%"},
+                        "region": {"startLine": f.line, "snippet": {"text": f.code_snippet}},
+                    }
+                }],
+                "properties": {
+                    "severity": f.severity.as_str(),
+                    "confidence": f.confidence.as_str(),
+                    "package": f.package,
+                },
+            })
+        })
+        .collect();
+    let mut invocation = json!({"executionSuccessful": true});
+    if !skipped_files.is_empty() {
+        let notes: Vec<serde_json::Value> = skipped_files
+            .iter()
+            .map(|name| {
+                json!({
+                    "level": "warning",
+                    "message": {"text": format!("{name} could not be parsed; AST checks did not run on it.")},
+                    "locations": [{"physicalLocation": {"artifactLocation": {"uri": sarif_uri(name), "uriBaseId": "%SRCROOT%"}}}],
+                })
+            })
+            .collect();
+        invocation["toolExecutionNotifications"] = serde_json::Value::Array(notes);
+    }
+    json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "fenceline",
+                "version": env!("CARGO_PKG_VERSION"),
+                "informationUri": "https://github.com/lvalverdeb/fenceline-rs",
+                "rules": rule_objects,
+            }},
+            "invocations": [invocation],
+            "results": results,
+        }],
+    })
+}
+
+pub fn print_sarif(all_findings: &[Finding], skipped_files: &[String]) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&sarif_report(all_findings, skipped_files)).unwrap()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +527,65 @@ mod tests {
     #[test]
     fn suppression_hint_absent_when_no_findings() {
         assert!(suppression_hint(false, 0, 0).is_none());
+    }
+
+    #[test]
+    fn sarif_report_maps_findings_to_rules_results_and_notifications() {
+        let low = Finding {
+            cwe_id: "CWE-117",
+            cwe_name: "Log Injection / Forging",
+            severity: Severity::Low,
+            package: "pkg".into(),
+            file: "sub\\mod.py".into(),
+            line: 7,
+            code_snippet: "logger.info(f'{x}')".into(),
+            description: "f-string in logger call".into(),
+            zero_day_relevance: "",
+            confidence: Confidence::High,
+        };
+        let critical = Finding {
+            cwe_id: "CWE-502",
+            cwe_name: "Deserialization of Untrusted Data",
+            severity: Severity::Critical,
+            package: "pkg".into(),
+            file: "mod.py".into(),
+            line: 1,
+            code_snippet: "pickle.loads(data)".into(),
+            description: "...".into(),
+            zero_day_relevance: "",
+            confidence: Confidence::Medium,
+        };
+        let log = sarif_report(&[low, critical], &["pkg/broken.py".to_string()]);
+        assert_eq!(log["version"], "2.1.0");
+        let run = &log["runs"][0];
+        let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["id"], "CWE-117");
+        assert_eq!(rules[1]["id"], "CWE-502");
+        assert_eq!(rules[1]["properties"]["security-severity"], "9.5");
+        assert!(rules[1]["helpUri"].as_str().unwrap().ends_with("/502.html"));
+        let results = run["results"].as_array().unwrap();
+        assert_eq!(results[0]["ruleId"], "CWE-502"); // severity order
+        assert_eq!(results[0]["ruleIndex"], 1);
+        assert_eq!(results[0]["level"], "error");
+        assert_eq!(results[1]["level"], "note");
+        assert_eq!(
+            results[1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "sub/mod.py"
+        );
+        assert_eq!(
+            results[1]["locations"][0]["physicalLocation"]["region"]["startLine"],
+            7
+        );
+        assert_eq!(results[0]["properties"]["confidence"], "MEDIUM");
+        let notes = run["invocations"][0]["toolExecutionNotifications"]
+            .as_array()
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0]["message"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("pkg/broken.py")
+        );
     }
 }

@@ -1,0 +1,7 @@
+- id: fenceline
+  name: fenceline
+  description: Zero-day security scanner for Python codebases (Rust port)
+  entry: fenceline
+  language: rust
+  types: [python]
+  pass_filenames: false

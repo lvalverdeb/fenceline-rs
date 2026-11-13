@@ -9,7 +9,7 @@ use crate::config::{
     DEP_MANIFEST_FILES, find_workspace_root, is_secure_path, load_severity_policy,
 };
 use crate::models::{Confidence, Finding, Severity};
-use crate::reporting::print_report;
+use crate::reporting::{print_report, print_sarif};
 use crate::scanner::{is_test_path, iter_py, mask_non_code, read_source, rel, split_lines};
 use crate::suppression::apply_suppressions;
 use clap::{Parser, ValueEnum};
@@ -165,6 +165,10 @@ pub struct Args {
     /// JSON output
     #[arg(long)]
     pub json: bool,
+
+    /// SARIF 2.1.0 output, for GitHub code scanning and other SARIF consumers
+    #[arg(long, conflicts_with = "json")]
+    pub sarif: bool,
 
     /// Suppress banner
     #[arg(long, short = 'q')]
@@ -499,7 +503,7 @@ pub fn run(args: &Args) -> i32 {
         }
     }
 
-    if !args.quiet && !args.json {
+    if !args.quiet && !args.json && !args.sarif {
         println!("\n  {}", "=".repeat(72));
         println!("  Zero-Day Security Audit — fenceline");
         println!("  CWEs: CWE Top 25 (2025) + OWASP Top 10:2025 + Python Zero-Day Patterns");
@@ -583,15 +587,15 @@ pub fn run(args: &Args) -> i32 {
             );
             return 2;
         }
-        print_report(
+        emit_report(
+            args,
             &mut all_findings,
-            args.json,
             0,
             nosec_suppressed,
             test_suppressed,
             &skipped_files,
         );
-        if !args.quiet && !args.json {
+        if !args.quiet && !args.json && !args.sarif {
             println!(
                 "  Wrote baseline with {} finding(s) to {}",
                 all_findings.len(),
@@ -619,9 +623,9 @@ pub fn run(args: &Args) -> i32 {
         }
     }
 
-    print_report(
+    emit_report(
+        args,
         &mut all_findings,
-        args.json,
         baseline_suppressed,
         nosec_suppressed,
         test_suppressed,
@@ -631,6 +635,29 @@ pub fn run(args: &Args) -> i32 {
     let threshold = args.fail_on.severity();
     let gating = all_findings.iter().any(|f| f.severity <= threshold);
     if gating { 1 } else { 0 }
+}
+
+/// Route the finished finding list to whichever format the flags chose.
+fn emit_report(
+    args: &Args,
+    all_findings: &mut [Finding],
+    baseline_suppressed: usize,
+    nosec_suppressed: usize,
+    test_suppressed: usize,
+    skipped_files: &[String],
+) {
+    if args.sarif {
+        print_sarif(all_findings, skipped_files);
+        return;
+    }
+    print_report(
+        all_findings,
+        args.json,
+        baseline_suppressed,
+        nosec_suppressed,
+        test_suppressed,
+        skipped_files,
+    );
 }
 
 #[cfg(test)]
@@ -821,5 +848,15 @@ mod tests {
         .collect();
         let manifest = PathBuf::from("/proj/pyproject.toml");
         assert_eq!(manifest_package_label(&manifest, &packages), "proj");
+    }
+
+    #[test]
+    fn sarif_and_json_flags_are_mutually_exclusive() {
+        assert!(Args::try_parse_from(["fenceline", "--sarif", "--json"]).is_err());
+        assert!(
+            Args::try_parse_from(["fenceline", "--sarif"])
+                .unwrap()
+                .sarif
+        );
     }
 }

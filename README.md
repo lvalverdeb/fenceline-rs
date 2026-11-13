@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`fenceline`](https://github.com/lval
 
 The [Python original](https://github.com/lvalverdeb/fenceline) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/fenceline/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk uncovered and matched along the way (some quite subtle — e.g. `check_assert_security`'s `\b(is|==|!=|in)\b` provably never matching `==`/`!=` written the normal way with spaces or quotes around them).
 
-**Status**: all 57 checks ported (40 AST-based, 15 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 62 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
+**Status**: all 57 checks ported (40 AST-based, 15 text-based, 2 manifest-based), plus `# nosec` inline suppression, baselining, and full CLI flag parity with the Python original — 64 tests passing, including a fixture-corpus conformance runner that diffs every check's output against the Python original's expected results field-by-field.
 
 ## Why It Exists
 
@@ -40,6 +40,7 @@ Exit codes: `0` (no findings at or above `--fail-on`), `1` (one or more).
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` | off | Machine-readable output |
+| `--sarif` | off | SARIF 2.1.0 output for GitHub code scanning and other SARIF consumers |
 | `--quiet` / `-q` | off | Suppress the banner |
 | `--config` | none | TOML file with a `packages` table of `name = "path"` entries; replaces cwd auto-discovery |
 | `--package` | none | Add or override one package as `NAME=PATH` (repeatable); applied on top of `--config` |
@@ -110,6 +111,24 @@ pickle.loads(data)  # nosec CWE-502 -- trusted internal cache, not user input
 fenceline --write-baseline fenceline-baseline.json   # snapshot today's findings
 fenceline --baseline fenceline-baseline.json          # only new findings fail CI
 ```
+
+### CI integration
+
+`--sarif` writes the scan as a SARIF 2.1.0 log (one rule per CWE with a MITRE
+`helpUri` and a GitHub `security-severity`, one result per finding, unparseable
+files as tool notifications), ready for GitHub's `upload-sarif` action or any
+SARIF viewer. The repository also ships a `.pre-commit-hooks.yaml`, so
+
+```yaml
+repos:
+  - repo: https://github.com/lvalverdeb/fenceline-rs
+    rev: v1.6.0
+    hooks:
+      - id: fenceline
+```
+
+builds the binary with cargo and scans the working tree whenever a Python
+file is staged.
 
 ## Design
 
