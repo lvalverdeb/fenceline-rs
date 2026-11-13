@@ -28,10 +28,10 @@ use crate::ast_helpers::{
 use crate::models::Confidence;
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
-    Arguments, Comprehension, Expr, ExprBinOp, ExprCall, ExprJoinedStr, ExprLambda, ExprNamedExpr,
-    Keyword, ModModule, Ranged, Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFor,
-    StmtAsyncFunctionDef, StmtAsyncWith, StmtAugAssign, StmtClassDef, StmtFor, StmtFunctionDef,
-    StmtImport, StmtImportFrom, StmtWith, Visitor, WithItem,
+    Arguments, BoolOp, CmpOp, Comprehension, Constant, Expr, ExprBinOp, ExprCall, ExprJoinedStr,
+    ExprLambda, ExprNamedExpr, Keyword, ModModule, Ranged, Stmt, StmtAnnAssign, StmtAssign,
+    StmtAsyncFor, StmtAsyncFunctionDef, StmtAsyncWith, StmtAugAssign, StmtClassDef, StmtFor,
+    StmtFunctionDef, StmtImport, StmtImportFrom, StmtWith, UnaryOp, Visitor, WithItem,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -581,6 +581,193 @@ fn param_names(args: &Arguments) -> HashSet<String> {
     out
 }
 
+/// A guard on a name: `(name, Some(container))` for `name in container`, or
+/// `(name, None)` for a check that needs no container (an anchored regex
+/// match, an `isdigit()`-style predicate, equality with a literal) --
+/// mirrors `taint._Guard`.
+type Guard = (String, Option<Expr>);
+
+const TERMINATING_CALLS: &[&str] = &["abort", "exit", "quit", "sys.exit", "os._exit"];
+const PREDICATE_METHODS: &[&str] = &[
+    "isdigit",
+    "isalnum",
+    "isalpha",
+    "isidentifier",
+    "isdecimal",
+    "isnumeric",
+];
+
+fn name_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.to_string()),
+        _ => None,
+    }
+}
+
+/// The name a call validates: `re.fullmatch(p, x)`, `re.match("...$", x)`,
+/// `PATTERN.fullmatch(x)`, or `x.isdigit()` -- mirrors
+/// `taint._anchored_match_target`.
+fn anchored_match_target(call: &ExprCall) -> Option<String> {
+    if let Expr::Attribute(a) = call.func.as_ref()
+        && PREDICATE_METHODS.contains(&a.attr.as_str())
+    {
+        return if call.args.is_empty() {
+            name_of(&a.value)
+        } else {
+            None
+        };
+    }
+    let dotted = expr_dotted_name(&call.func);
+    let args = &call.args;
+    if dotted == "re.fullmatch" && args.len() >= 2 {
+        return name_of(&args[1]);
+    }
+    if dotted == "re.match"
+        && args.len() >= 2
+        && let Expr::Constant(k) = &args[0]
+        && let Constant::Str(pattern) = &k.value
+        && (pattern.ends_with('$') || pattern.ends_with("\\Z"))
+    {
+        return name_of(&args[1]);
+    }
+    if let Expr::Attribute(a) = call.func.as_ref()
+        && a.attr.as_str() == "fullmatch"
+        && args.len() == 1
+    {
+        return name_of(&args[0]);
+    }
+    None
+}
+
+/// `(when true, when false)`: the names `test` vouches for in each branch --
+/// mirrors `taint._guard_names`.
+fn guard_names(test: &Expr) -> (Vec<Guard>, Vec<Guard>) {
+    match test {
+        Expr::UnaryOp(u) if u.op == UnaryOp::Not => {
+            let (pos, neg) = guard_names(&u.operand);
+            (neg, pos)
+        }
+        Expr::BoolOp(b) => {
+            let parts: Vec<_> = b.values.iter().map(guard_names).collect();
+            match b.op {
+                BoolOp::And => (parts.into_iter().flat_map(|(p, _)| p).collect(), vec![]),
+                BoolOp::Or => (vec![], parts.into_iter().flat_map(|(_, n)| n).collect()),
+            }
+        }
+        Expr::Compare(c) if c.ops.len() == 1 => {
+            let Some(name) = name_of(&c.left) else {
+                return (vec![], vec![]);
+            };
+            let right = &c.comparators[0];
+            match c.ops[0] {
+                CmpOp::In => (vec![(name, Some(right.clone()))], vec![]),
+                CmpOp::NotIn => (vec![], vec![(name, Some(right.clone()))]),
+                CmpOp::Eq if matches!(right, Expr::Constant(_)) => (vec![(name, None)], vec![]),
+                CmpOp::NotEq if matches!(right, Expr::Constant(_)) => (vec![], vec![(name, None)]),
+                _ => (vec![], vec![]),
+            }
+        }
+        Expr::Call(c) => match anchored_match_target(c) {
+            Some(name) => (vec![(name, None)], vec![]),
+            None => (vec![], vec![]),
+        },
+        _ => (vec![], vec![]),
+    }
+}
+
+/// The block never falls through -- mirrors `taint._terminates`.
+fn terminates(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        None => false,
+        Some(Stmt::Raise(_) | Stmt::Return(_) | Stmt::Continue(_) | Stmt::Break(_)) => true,
+        Some(Stmt::Expr(e)) => match e.value.as_ref() {
+            Expr::Call(c) => TERMINATING_CALLS.contains(&expr_dotted_name(&c.func).as_str()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Every name any assignment anywhere inside a statement (nested scopes
+/// excluded) binds -- mirrors `taint._bound_names`.
+#[derive(Default)]
+struct BoundNames(HashSet<String>);
+
+impl BoundNames {
+    fn target(&mut self, target: &Expr) {
+        let mut names = Vec::new();
+        bind_names(target, &mut names);
+        self.0.extend(names);
+    }
+}
+
+impl Visitor for BoundNames {
+    fn visit_stmt_function_def(&mut self, _node: StmtFunctionDef) {}
+    fn visit_stmt_async_function_def(&mut self, _node: StmtAsyncFunctionDef) {}
+    fn visit_stmt_class_def(&mut self, _node: StmtClassDef) {}
+    fn visit_expr_lambda(&mut self, _node: ExprLambda) {}
+    fn visit_stmt_assign(&mut self, node: StmtAssign) {
+        for target in &node.targets {
+            self.target(target);
+        }
+        self.generic_visit_stmt_assign(node);
+    }
+    fn visit_stmt_ann_assign(&mut self, node: StmtAnnAssign) {
+        self.target(&node.target);
+        self.generic_visit_stmt_ann_assign(node);
+    }
+    fn visit_stmt_aug_assign(&mut self, node: StmtAugAssign) {
+        self.target(&node.target);
+        self.generic_visit_stmt_aug_assign(node);
+    }
+    fn visit_expr_named_expr(&mut self, node: ExprNamedExpr) {
+        self.target(&node.target);
+        self.generic_visit_expr_named_expr(node);
+    }
+    fn visit_stmt_for(&mut self, node: StmtFor) {
+        self.target(&node.target);
+        self.generic_visit_stmt_for(node);
+    }
+    fn visit_stmt_async_for(&mut self, node: StmtAsyncFor) {
+        self.target(&node.target);
+        self.generic_visit_stmt_async_for(node);
+    }
+    fn visit_stmt_with(&mut self, node: StmtWith) {
+        for item in &node.items {
+            if let Some(vars) = &item.optional_vars {
+                self.target(vars);
+            }
+        }
+        self.generic_visit_stmt_with(node);
+    }
+    fn visit_stmt_async_with(&mut self, node: StmtAsyncWith) {
+        for item in &node.items {
+            if let Some(vars) = &item.optional_vars {
+                self.target(vars);
+            }
+        }
+        self.generic_visit_stmt_async_with(node);
+    }
+    fn visit_arguments(&mut self, node: Arguments) {
+        walk_arguments_children(self, node);
+    }
+    fn visit_comprehension(&mut self, node: Comprehension) {
+        walk_comprehension_children(self, node);
+    }
+    fn visit_keyword(&mut self, node: Keyword) {
+        walk_keyword_children(self, node);
+    }
+    fn visit_withitem(&mut self, node: WithItem) {
+        walk_withitem_children(self, node);
+    }
+}
+
+fn bound_names(stmt: &Stmt) -> HashSet<String> {
+    let mut v = BoundNames::default();
+    v.visit_stmt(stmt.clone());
+    v.0
+}
+
 enum Frame {
     /// A function and its qualified name (`Class.method`, `outer.inner`).
     Function(Rc<ScopeInfo>, String),
@@ -599,9 +786,134 @@ struct ScopeIndexer {
     frames: Vec<Frame>,
     at: HashMap<TextSize, Option<Rc<ScopeInfo>>>,
     functions: HashMap<String, Rc<ScopeInfo>>,
+    /// Guards that hold at the statement being visited.
+    guarded: Vec<Guard>,
+    guards_at: HashMap<TextSize, Vec<Guard>>,
 }
 
 impl ScopeIndexer {
+    fn record(&mut self, start: TextSize) {
+        self.at.insert(start, self.current());
+        if !self.guarded.is_empty() {
+            self.guards_at.insert(start, self.guarded.clone());
+        }
+    }
+
+    /// Walk a statement block tracking guards -- mirrors `taint._walk_guards`.
+    /// A block starts with its parent's guards and its own do not outlive
+    /// it, except that an `if` whose body cannot fall through leaves its
+    /// negated test in force for the statements after it.
+    fn walk_block(&mut self, stmts: Vec<Stmt>) {
+        let saved = self.guarded.clone();
+        for stmt in stmts {
+            let killed = if self.guarded.is_empty() {
+                HashSet::new()
+            } else {
+                bound_names(&stmt)
+            };
+            match stmt {
+                Stmt::If(node) => {
+                    let (pos, neg) = guard_names(&node.test);
+                    self.visit_expr(*node.test);
+                    let body_ends = terminates(&node.body);
+                    let orelse_ends = terminates(&node.orelse);
+                    self.walk_guarded(node.body, &pos);
+                    self.walk_guarded(node.orelse, &neg);
+                    if body_ends {
+                        self.guarded.extend(neg);
+                    }
+                    if orelse_ends {
+                        self.guarded.extend(pos);
+                    }
+                }
+                Stmt::While(node) => {
+                    let (pos, neg) = guard_names(&node.test);
+                    self.visit_expr(*node.test);
+                    self.walk_guarded(node.body, &pos);
+                    self.walk_guarded(node.orelse, &neg);
+                }
+                Stmt::Assert(node) => {
+                    let (pos, _) = guard_names(&node.test);
+                    self.visit_expr(*node.test);
+                    if let Some(msg) = node.msg {
+                        self.visit_expr(*msg);
+                    }
+                    self.guarded.extend(pos);
+                }
+                Stmt::For(node) => {
+                    self.visit_expr(*node.target);
+                    self.visit_expr(*node.iter);
+                    self.walk_block(node.body);
+                    self.walk_block(node.orelse);
+                }
+                Stmt::AsyncFor(node) => {
+                    self.visit_expr(*node.target);
+                    self.visit_expr(*node.iter);
+                    self.walk_block(node.body);
+                    self.walk_block(node.orelse);
+                }
+                Stmt::With(node) => {
+                    for item in node.items {
+                        self.visit_withitem(item);
+                    }
+                    self.walk_block(node.body);
+                }
+                Stmt::AsyncWith(node) => {
+                    for item in node.items {
+                        self.visit_withitem(item);
+                    }
+                    self.walk_block(node.body);
+                }
+                Stmt::Try(node) => {
+                    self.walk_try(node.body, node.handlers, node.orelse, node.finalbody);
+                }
+                Stmt::TryStar(node) => {
+                    self.walk_try(node.body, node.handlers, node.orelse, node.finalbody);
+                }
+                Stmt::Match(node) => {
+                    self.visit_expr(*node.subject);
+                    for case in node.cases {
+                        if let Some(guard) = case.guard {
+                            self.visit_expr(*guard);
+                        }
+                        self.walk_block(case.body);
+                    }
+                }
+                other => self.visit_stmt(other),
+            }
+            if !killed.is_empty() {
+                self.guarded.retain(|(name, _)| !killed.contains(name));
+            }
+        }
+        self.guarded = saved;
+    }
+
+    fn walk_guarded(&mut self, body: Vec<Stmt>, extra: &[Guard]) {
+        let n = self.guarded.len();
+        self.guarded.extend(extra.iter().cloned());
+        self.walk_block(body);
+        self.guarded.truncate(n);
+    }
+
+    fn walk_try(
+        &mut self,
+        body: Vec<Stmt>,
+        handlers: Vec<rustpython_ast::ExceptHandler>,
+        orelse: Vec<Stmt>,
+        finalbody: Vec<Stmt>,
+    ) {
+        self.walk_block(body);
+        for handler in handlers {
+            let rustpython_ast::ExceptHandler::ExceptHandler(h) = handler;
+            if let Some(type_) = h.type_ {
+                self.visit_expr(*type_);
+            }
+            self.walk_block(h.body);
+        }
+        self.walk_block(orelse);
+        self.walk_block(finalbody);
+    }
+
     fn current(&self) -> Option<Rc<ScopeInfo>> {
         match self.frames.last() {
             None => Some(Rc::clone(&self.module)),
@@ -691,9 +1003,10 @@ impl ScopeIndexer {
         }
         self.frames.pop();
         self.frames.push(Frame::Function(scope, qualname));
-        for stmt in body {
-            self.visit_stmt(stmt);
-        }
+        // A function body starts without its enclosing block's guards.
+        let outer_guards = std::mem::take(&mut self.guarded);
+        self.walk_block(body);
+        self.guarded = outer_guards;
         self.frames.pop();
     }
 }
@@ -738,15 +1051,15 @@ impl Visitor for ScopeIndexer {
     }
 
     fn visit_expr_call(&mut self, node: ExprCall) {
-        self.at.insert(node.start(), self.current());
+        self.record(node.start());
         self.generic_visit_expr_call(node);
     }
     fn visit_expr_bin_op(&mut self, node: ExprBinOp) {
-        self.at.insert(node.start(), self.current());
+        self.record(node.start());
         self.generic_visit_expr_bin_op(node);
     }
     fn visit_expr_joined_str(&mut self, node: ExprJoinedStr) {
-        self.at.insert(node.start(), self.current());
+        self.record(node.start());
         self.generic_visit_expr_joined_str(node);
     }
 
@@ -768,6 +1081,7 @@ impl Visitor for ScopeIndexer {
 pub struct TaintIndex {
     at: HashMap<TextSize, Option<Rc<ScopeInfo>>>,
     functions: HashMap<String, Rc<ScopeInfo>>,
+    guards_at: HashMap<TextSize, Vec<Guard>>,
 }
 
 impl TaintIndex {
@@ -788,13 +1102,14 @@ impl TaintIndex {
             frames: Vec::new(),
             at: HashMap::new(),
             functions: HashMap::new(),
+            guarded: Vec::new(),
+            guards_at: HashMap::new(),
         };
-        for stmt in tree.body.clone() {
-            indexer.visit_stmt(stmt);
-        }
+        indexer.walk_block(tree.body.clone());
         TaintIndex {
             at: indexer.at,
             functions: indexer.functions,
+            guards_at: indexer.guards_at,
         }
     }
 
@@ -829,10 +1144,29 @@ impl TaintIndex {
         anchor: TextSize,
         exprs: impl IntoIterator<Item = &'e Expr>,
     ) -> Taint {
-        match self.at.get(&anchor) {
-            Some(Some(scope)) => Classifier::new(scope).many(exprs, 0),
-            _ => Taint::Internal,
-        }
+        let Some(Some(scope)) = self.at.get(&anchor) else {
+            return Taint::Internal;
+        };
+        // A guard vouches for a name only against a container the function
+        // did not derive from input.
+        let clean: HashSet<String> = self
+            .guards_at
+            .get(&anchor)
+            .map(|guards| {
+                guards
+                    .iter()
+                    .filter(|(_, container)| {
+                        container
+                            .as_ref()
+                            .is_none_or(|c| Classifier::new(scope).expr(c, 0) == Taint::Clean)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut classifier = Classifier::new(scope);
+        classifier.clean_names = clean;
+        classifier.many(exprs, 0)
     }
 
     /// Every expression assigned to `name` in the scope of the sink node
@@ -856,6 +1190,8 @@ struct Classifier<'s> {
     active: HashSet<String>,
     /// `self.<field>` names being resolved up the chain (cycle guard).
     active_fields: HashSet<String>,
+    /// Names a guard vouches for where the sink executes.
+    clean_names: HashSet<String>,
 }
 
 impl<'s> Classifier<'s> {
@@ -864,6 +1200,7 @@ impl<'s> Classifier<'s> {
             scope,
             active: HashSet::new(),
             active_fields: HashSet::new(),
+            clean_names: HashSet::new(),
         }
     }
 
@@ -889,6 +1226,7 @@ impl<'s> Classifier<'s> {
                 scope: &scope,
                 active: HashSet::new(),
                 active_fields: active.clone(),
+                clean_names: HashSet::new(),
             };
             worst = worst.max(sub.expr(value, depth + 1));
             if worst == Taint::Source {
@@ -901,6 +1239,9 @@ impl<'s> Classifier<'s> {
     fn name(&mut self, name: &str, depth: u32) -> Taint {
         if REQUEST_ROOTS.contains(&name) {
             return Taint::Source;
+        }
+        if self.clean_names.contains(name) {
+            return Taint::Clean;
         }
         if self.scope.params.contains(name) {
             if self.scope.handler {
