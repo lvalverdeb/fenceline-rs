@@ -73,10 +73,10 @@ For the injection-shaped checks (command, code, SQL, template and CRLF injection
 | --- | --- |
 | A recognised entry point: a `request` object, `os.environ`, `sys.argv`, `input()`, a socket read, or a parameter of a route-decorated function or handler method | `HIGH` |
 | A parameter that some caller elsewhere in the package feeds request data | `HIGH`, with a note on the finding |
-| Plain function parameters, `self` attributes, or values the function cannot resolve | `MEDIUM`, with a note on the finding |
+| Plain function parameters, `self` fields no method of the class assigns from a source, or values the function cannot resolve | `MEDIUM`, with a note on the finding |
 | Only literals, module constants, library references, or values that cannot carry a payload (a length, an `int()`, a `shlex.quote()`) | not reported |
 
-Within a function the analysis follows assignments without regard to order, so it is deliberately pessimistic. Across functions it follows calls (`src/callers.rs`): once every file of a package is parsed, each call's arguments are bound to the callee's parameters, and a parameter that receives request data from any caller is treated as request data inside the callee, to a fixpoint. Callees are resolved by name (same file, `import mod`, `from .mod import f`, `Class.method`, `self.method`); a method on an object of unknown type still lands in the `MEDIUM` row. Use `--confidence-min medium` to cut noise from the fuzzier regex checks, and `--confidence-min high` to see only findings where attacker-controlled input provably reaches the sink.
+Within a function the analysis follows assignments without regard to order, so it is deliberately pessimistic. Across functions it follows calls (`src/callers.rs`): once every file of a package is parsed, each call's arguments are bound to the callee's parameters, and a parameter that receives request data from any caller is treated as request data inside the callee, to a fixpoint. Callees are resolved by name (same file, `import mod`, `from .mod import f`, `Class.method`, `self.method`); a method on an object of unknown type still lands in the `MEDIUM` row. A `self` field takes the worst taint of every value any method of the class assigns to it, each resolved in that method; a field nothing in the class assigns stays `MEDIUM`. Use `--confidence-min medium` to cut noise from the fuzzier regex checks, and `--confidence-min high` to see only findings where attacker-controlled input provably reaches the sink.
 
 ## Severity policy
 

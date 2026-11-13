@@ -35,7 +35,7 @@ use rustpython_ast::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Taint {
@@ -321,6 +321,69 @@ pub struct ScopeInfo {
     /// The enclosing class is a view/handler class, so `self.kwargs` and
     /// `self.args` hold URL captures.
     view_class: bool,
+    /// `self.<field>` -> every value assigned to it anywhere in the class,
+    /// with the scope of the method that assigns it. Shared by the class's
+    /// methods; `Weak` because those scopes own the map.
+    fields: SharedFields,
+}
+
+type FieldMap = HashMap<String, Vec<(Expr, Weak<ScopeInfo>)>>;
+type SharedFields = Rc<RefCell<FieldMap>>;
+
+/// Every `self.<field> = value` directly in one method's body (nested
+/// scopes excluded) -- mirrors `taint._self_fields`.
+struct FieldCollector {
+    scope: Weak<ScopeInfo>,
+    fields: SharedFields,
+}
+
+impl FieldCollector {
+    fn record(&self, target: &Expr, value: &Expr) {
+        if let Expr::Attribute(a) = target
+            && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self")
+        {
+            self.fields
+                .borrow_mut()
+                .entry(a.attr.to_string())
+                .or_default()
+                .push((value.clone(), Weak::clone(&self.scope)));
+        }
+    }
+}
+
+impl Visitor for FieldCollector {
+    fn visit_stmt_function_def(&mut self, _node: StmtFunctionDef) {}
+    fn visit_stmt_async_function_def(&mut self, _node: StmtAsyncFunctionDef) {}
+    fn visit_stmt_class_def(&mut self, _node: StmtClassDef) {}
+    fn visit_expr_lambda(&mut self, _node: ExprLambda) {}
+    fn visit_stmt_assign(&mut self, node: StmtAssign) {
+        for target in &node.targets {
+            self.record(target, &node.value);
+        }
+        self.generic_visit_stmt_assign(node);
+    }
+    fn visit_stmt_ann_assign(&mut self, node: StmtAnnAssign) {
+        if let Some(value) = &node.value {
+            self.record(&node.target, value);
+        }
+        self.generic_visit_stmt_ann_assign(node);
+    }
+    fn visit_stmt_aug_assign(&mut self, node: StmtAugAssign) {
+        self.record(&node.target, &node.value);
+        self.generic_visit_stmt_aug_assign(node);
+    }
+    fn visit_arguments(&mut self, node: Arguments) {
+        walk_arguments_children(self, node);
+    }
+    fn visit_comprehension(&mut self, node: Comprehension) {
+        walk_comprehension_children(self, node);
+    }
+    fn visit_keyword(&mut self, node: Keyword) {
+        walk_keyword_children(self, node);
+    }
+    fn visit_withitem(&mut self, node: WithItem) {
+        walk_withitem_children(self, node);
+    }
 }
 
 /// Every `Name` inside an assignment target, like `ast.walk(target)` in the
@@ -521,8 +584,9 @@ fn param_names(args: &Arguments) -> HashSet<String> {
 enum Frame {
     /// A function and its qualified name (`Class.method`, `outer.inner`).
     Function(Rc<ScopeInfo>, String),
-    /// A class: its name and its bases' dotted names.
-    Class(String, Vec<String>),
+    /// A class: its name, its bases' dotted names, and its methods' shared
+    /// `self` field map.
+    Class(String, Vec<String>, SharedFields),
     /// A lambda, decorator, default argument or class base: no scope.
     Opaque,
 }
@@ -546,9 +610,9 @@ impl ScopeIndexer {
         }
     }
 
-    fn enclosing_class(&self) -> Option<(&str, &[String])> {
+    fn enclosing_class(&self) -> Option<(&str, &[String], &SharedFields)> {
         match self.frames.last() {
-            Some(Frame::Class(name, bases)) => Some((name, bases)),
+            Some(Frame::Class(name, bases, fields)) => Some((name, bases, fields)),
             _ => None,
         }
     }
@@ -556,7 +620,7 @@ impl ScopeIndexer {
     /// `Class.` / `outer.` / "" -- what precedes a function's own name.
     fn qualname_prefix(&self) -> String {
         match self.frames.last() {
-            Some(Frame::Class(name, _)) => format!("{name}."),
+            Some(Frame::Class(name, ..)) => format!("{name}."),
             Some(Frame::Function(_, qualname)) => format!("{qualname}."),
             _ => String::new(),
         }
@@ -570,7 +634,7 @@ impl ScopeIndexer {
         body: &[Stmt],
     ) -> Rc<ScopeInfo> {
         let cls = self.enclosing_class();
-        let bases = cls.map(|(_, bases)| bases);
+        let bases = cls.map(|(_, bases, _)| bases);
         let handler = is_handler(name, args, decorators, bases);
         let own = collect_own(body);
         let mut assigns: HashMap<String, Vec<Expr>> = self
@@ -589,9 +653,10 @@ impl ScopeIndexer {
             handler,
             assigns,
             imports,
-            cls: cls.map(|(name, _)| name.to_string()),
+            cls: cls.map(|(name, ..)| name.to_string()),
             caller_params: RefCell::new(HashSet::new()),
             view_class: is_view_class(bases),
+            fields: cls.map_or_else(Default::default, |(_, _, fields)| Rc::clone(fields)),
         })
     }
 
@@ -606,6 +671,15 @@ impl ScopeIndexer {
         let scope = self.function_scope(name, &args, &decorators, &body);
         let qualname = format!("{}{name}", self.qualname_prefix());
         self.functions.insert(qualname.clone(), Rc::clone(&scope));
+        if matches!(self.frames.last(), Some(Frame::Class(..))) {
+            let mut collector = FieldCollector {
+                scope: Rc::downgrade(&scope),
+                fields: Rc::clone(&scope.fields),
+            };
+            for stmt in &body {
+                collector.visit_stmt(stmt.clone());
+            }
+        }
         // Decorators, defaults and annotations belong to no scope.
         self.frames.push(Frame::Opaque);
         for deco in decorators {
@@ -649,7 +723,11 @@ impl Visitor for ScopeIndexer {
     }
     fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
         let bases: Vec<String> = node.bases.iter().map(expr_dotted_name).collect();
-        self.frames.push(Frame::Class(node.name.to_string(), bases));
+        self.frames.push(Frame::Class(
+            node.name.to_string(),
+            bases,
+            Default::default(),
+        ));
         self.generic_visit_stmt_class_def(node);
         self.frames.pop();
     }
@@ -703,6 +781,7 @@ impl TaintIndex {
             cls: None,
             caller_params: RefCell::new(HashSet::new()),
             view_class: false,
+            fields: Default::default(),
         });
         let mut indexer = ScopeIndexer {
             module,
@@ -775,6 +854,8 @@ fn source_chain(dotted: &str) -> bool {
 struct Classifier<'s> {
     scope: &'s ScopeInfo,
     active: HashSet<String>,
+    /// `self.<field>` names being resolved up the chain (cycle guard).
+    active_fields: HashSet<String>,
 }
 
 impl<'s> Classifier<'s> {
@@ -782,7 +863,39 @@ impl<'s> Classifier<'s> {
         Classifier {
             scope,
             active: HashSet::new(),
+            active_fields: HashSet::new(),
         }
+    }
+
+    /// Taint of `self.<name>`: the worst value assigned to it anywhere in
+    /// the class, each resolved in its own method's scope. A field is never
+    /// below `Internal` -- it may be set from outside the class.
+    fn field(&mut self, name: &str, depth: u32) -> Taint {
+        let fields = self.scope.fields.borrow();
+        let Some(values) = fields.get(name) else {
+            return Taint::Internal;
+        };
+        if self.active_fields.contains(name) {
+            return Taint::Internal;
+        }
+        let mut active = self.active_fields.clone();
+        active.insert(name.to_string());
+        let mut worst = Taint::Internal;
+        for (value, scope) in values {
+            let Some(scope) = scope.upgrade() else {
+                continue;
+            };
+            let mut sub = Classifier {
+                scope: &scope,
+                active: HashSet::new(),
+                active_fields: active.clone(),
+            };
+            worst = worst.max(sub.expr(value, depth + 1));
+            if worst == Taint::Source {
+                break;
+            }
+        }
+        worst
     }
 
     fn name(&mut self, name: &str, depth: u32) -> Taint {
@@ -841,7 +954,7 @@ impl<'s> Classifier<'s> {
                     return Taint::Source;
                 }
                 if matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self") {
-                    return Taint::Internal;
+                    return self.field(a.attr.as_str(), depth);
                 }
                 self.expr(&a.value, depth + 1)
             }
