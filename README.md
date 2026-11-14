@@ -34,7 +34,7 @@ out (columns preserved), so only real code is matched.
 
 **Status**: all 58 checks ported, plus `# nosec` inline suppression,
 baselining, severity policy, SARIF and full CLI flag parity with the Python
-original — 66 tests passing, including a fixture-corpus conformance runner
+original — 67 tests passing, including a fixture-corpus conformance runner
 that diffs every check's output against the Python original's expected
 results field-by-field. On the benchmark apps and on a reference corpus of
 real libraries the two ports produce identical findings, description for
@@ -201,9 +201,9 @@ from a full replacement, in the order we intend to close it:
 
 - The false-positive rate on ordinary, non-vulnerable code is not measured
   yet. The benchmark apps are built to be vulnerable, so they test recall
-  far better than noise. The library corpus used for regression testing
-  shows the known costs: any name `request` is treated as a source, which
-  misfires on code that builds outbound requests.
+  far better than noise. A library corpus (aiohttp, botocore, tornado,
+  PyYAML) is scanned for regressions and audited by hand, but it has no
+  ground truth.
 - Three apps is a small benchmark, and the cross-file analysis has had only
   a handful of findings to prove itself on. A Django or FastAPI project with
   a service layer is the next addition.
@@ -237,7 +237,7 @@ what they find:
 
 | The sink is fed by | Confidence |
 | --- | --- |
-| A recognised entry point: a `request` object, `os.environ`, `sys.argv`, `input()`, a socket read, or a parameter of a route-decorated function or handler method | `HIGH` |
+| A recognised entry point: the `request` of a handler or of a module that imports a web framework, `os.environ`, `sys.argv`, `input()`, a socket read, or a parameter of a route-decorated function or handler method | `HIGH` |
 | A parameter that some caller elsewhere in the package feeds request data | `HIGH`, with a note on the finding |
 | Plain function parameters, `self` fields no method of the class assigns from a source, or values the function cannot resolve | `MEDIUM`, with a note on the finding |
 | Only literals, module constants, library references, or values that cannot carry a payload (a length, an `int()`, a `shlex.quote()`) | not reported |
@@ -260,9 +260,14 @@ name (same file, `import mod`, `from .mod import f`, `Class.method`,
 the `MEDIUM` row. A `self` field takes the worst taint of every value any
 method of the class assigns to it, each resolved in that method, so a URL
 stored by `__init__` or a handler and used elsewhere carries its origin; a
-field nothing in the class assigns stays `MEDIUM`. Use `--confidence-min medium` to
-cut noise from the fuzzier regex checks, and `--confidence-min high` to see
-only findings where attacker-controlled input provably reaches the sink.
+field nothing in the class assigns stays `MEDIUM`. The name `request` counts
+as web input only inside a handler or in a module that imports a web
+framework (Flask, Django, aiohttp, Starlette, FastAPI and the like) anywhere,
+even lazily; in a client library that builds outbound requests, or after
+`from urllib import request`, it resolves like any other name. Use
+`--confidence-min medium` to cut noise from the fuzzier regex checks, and
+`--confidence-min high` to see only findings where attacker-controlled input
+provably reaches the sink.
 
 ### Severity policy
 

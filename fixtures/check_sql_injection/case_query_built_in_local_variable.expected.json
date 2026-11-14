@@ -4,13 +4,13 @@
       "cwe_id": "CWE-89",
       "severity": "CRITICAL",
       "confidence": "MEDIUM",
-      "line": 5
+      "line": 6
     },
     {
       "cwe_id": "CWE-89",
       "severity": "CRITICAL",
       "confidence": "HIGH",
-      "line": 15
+      "line": 16
     }
   ]
 }

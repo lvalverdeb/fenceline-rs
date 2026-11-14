@@ -4,7 +4,7 @@
       "cwe_id": "CWE-770",
       "severity": "INFO",
       "confidence": "HIGH",
-      "line": 7
+      "line": 8
     }
   ]
 }

@@ -1,3 +1,4 @@
+from django.http import HttpResponse
 def load(request):
     with open("/etc/app/config.toml") as f:
         config = f.read()

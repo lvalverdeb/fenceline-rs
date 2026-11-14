@@ -55,8 +55,36 @@ pub const INTERNAL_NOTE: &str =
 pub const CALLER_NOTE: &str =
     " Request data reaches a parameter of this function from a caller in the package.";
 
+/// Names that carry request data when used as the root of a chain.
+/// `request` is only a web request inside a handler or in a module that
+/// imports a web framework (`WEB_FRAMEWORKS`); elsewhere -- a client library
+/// building an outbound request, `from urllib import request` -- it resolves
+/// like any other name. `environ` is unconditional: WSGI or
+/// `from os import environ`.
 const REQUEST_ROOTS: &[&str] = &["request", "environ"];
-const SOURCE_PREFIXES: &[&str] = &["os.environ", "sys.argv", "sys.stdin", "self.request"];
+/// Top-level module names whose import marks a module as web-facing.
+const WEB_FRAMEWORKS: &[&str] = &[
+    "aiohttp",
+    "blacksheep",
+    "bottle",
+    "chalice",
+    "cherrypy",
+    "connexion",
+    "django",
+    "falcon",
+    "fastapi",
+    "flask",
+    "litestar",
+    "pyramid",
+    "quart",
+    "rest_framework",
+    "sanic",
+    "starlette",
+    "tornado",
+    "webob",
+    "werkzeug",
+];
+const SOURCE_PREFIXES: &[&str] = &["os.environ", "sys.argv", "sys.stdin"];
 const SOURCE_CALLS: &[&str] = &["input", "os.getenv", "os.environb.get"];
 const SOURCE_METHODS: &[&str] = &[
     "recv",
@@ -313,6 +341,9 @@ pub struct ScopeInfo {
     handler: bool,
     assigns: HashMap<String, Vec<Expr>>,
     imports: HashSet<String>,
+    /// The module imports a web framework somewhere, so the name `request`
+    /// (and `self.request`) denotes an inbound web request.
+    web: bool,
     /// Name of the class whose body directly holds this function, if any.
     cls: Option<String>,
     /// Parameters some caller in the package feeds request data (set by
@@ -506,6 +537,41 @@ impl Visitor for ScopeCollector {
     fn visit_withitem(&mut self, node: WithItem) {
         walk_withitem_children(self, node);
     }
+}
+
+/// Does any `import` in the module, at any depth (views often import
+/// lazily), name a web framework? Mirrors `taint._imports_web_framework`.
+struct WebImports(bool);
+
+impl Visitor for WebImports {
+    fn visit_stmt_import(&mut self, node: StmtImport) {
+        if node
+            .names
+            .iter()
+            .any(|alias| WEB_FRAMEWORKS.contains(&alias.name.split('.').next().unwrap_or("")))
+        {
+            self.0 = true;
+        }
+    }
+    fn visit_stmt_import_from(&mut self, node: StmtImportFrom) {
+        let top_level = node.level.is_none_or(|l| l.to_u32() == 0);
+        if top_level
+            && node
+                .module
+                .as_deref()
+                .is_some_and(|m| WEB_FRAMEWORKS.contains(&m.split('.').next().unwrap_or("")))
+        {
+            self.0 = true;
+        }
+    }
+}
+
+fn imports_web_framework(tree: &ModModule) -> bool {
+    let mut v = WebImports(false);
+    for stmt in &tree.body {
+        v.visit_stmt(stmt.clone());
+    }
+    v.0
 }
 
 fn collect_own(stmts: &[Stmt]) -> ScopeCollector {
@@ -965,6 +1031,7 @@ impl ScopeIndexer {
             handler,
             assigns,
             imports,
+            web: self.module.web,
             cls: cls.map(|(name, ..)| name.to_string()),
             caller_params: RefCell::new(HashSet::new()),
             view_class: is_view_class(bases),
@@ -1092,6 +1159,7 @@ impl TaintIndex {
             handler: false,
             assigns: own.assigns,
             imports: own.imports,
+            web: imports_web_framework(tree),
             cls: None,
             caller_params: RefCell::new(HashSet::new()),
             view_class: false,
@@ -1180,11 +1248,6 @@ impl TaintIndex {
     }
 }
 
-fn source_chain(dotted: &str) -> bool {
-    let root = dotted.split('.').next().unwrap_or("");
-    REQUEST_ROOTS.contains(&root) || SOURCE_PREFIXES.iter().any(|p| dotted.starts_with(p))
-}
-
 struct Classifier<'s> {
     scope: &'s ScopeInfo,
     active: HashSet<String>,
@@ -1236,8 +1299,24 @@ impl<'s> Classifier<'s> {
         worst
     }
 
+    /// Is the bare name `request` / `environ` a source here?
+    fn request_root(&self, name: &str) -> bool {
+        name == "environ" || self.scope.web || self.scope.handler
+    }
+
+    fn source_chain(&self, dotted: &str) -> bool {
+        let root = dotted.split('.').next().unwrap_or("");
+        if REQUEST_ROOTS.contains(&root) {
+            return self.request_root(root);
+        }
+        if dotted == "self.request" || dotted.starts_with("self.request.") {
+            return self.request_root("request");
+        }
+        SOURCE_PREFIXES.iter().any(|p| dotted.starts_with(p))
+    }
+
     fn name(&mut self, name: &str, depth: u32) -> Taint {
-        if REQUEST_ROOTS.contains(&name) {
+        if REQUEST_ROOTS.contains(&name) && self.request_root(name) {
             return Taint::Source;
         }
         if self.clean_names.contains(name) {
@@ -1288,7 +1367,7 @@ impl<'s> Classifier<'s> {
             Expr::Name(n) => self.name(n.id.as_str(), depth),
             Expr::Attribute(a) => {
                 let dotted = expr_dotted_name(node);
-                if !dotted.is_empty() && source_chain(&dotted) {
+                if !dotted.is_empty() && self.source_chain(&dotted) {
                     return Taint::Source;
                 }
                 if self.scope.view_class && is_view_capture(&dotted) {
@@ -1301,7 +1380,7 @@ impl<'s> Classifier<'s> {
             }
             Expr::Subscript(s) => {
                 let dotted = expr_dotted_name(&s.value);
-                if !dotted.is_empty() && source_chain(&dotted) {
+                if !dotted.is_empty() && self.source_chain(&dotted) {
                     return Taint::Source;
                 }
                 if self.scope.view_class && is_view_capture(&dotted) {
@@ -1317,7 +1396,7 @@ impl<'s> Classifier<'s> {
                     _ => "",
                 };
                 if SOURCE_CALLS.contains(&dotted.as_str())
-                    || source_chain(&dotted)
+                    || self.source_chain(&dotted)
                     || SOURCE_METHODS.contains(&method)
                 {
                     return Taint::Source;
@@ -1451,6 +1530,54 @@ mod tests {
             Taint::Source
         );
         assert_eq!(sink_taint("def helper(q):\n    sink(q)\n"), Taint::Internal);
+    }
+
+    #[test]
+    fn request_is_web_input_only_in_handlers_or_web_modules() {
+        let plain = "def helper(request):\n    sink(request.args['x'])\n";
+        assert_eq!(sink_taint(plain), Taint::Internal);
+        assert_eq!(sink_taint(&format!("import flask\n{plain}")), Taint::Source);
+        assert_eq!(
+            sink_taint(&format!("from django.http import HttpResponse\n{plain}")),
+            Taint::Source
+        );
+        assert_eq!(
+            sink_taint(&format!("from .http import request\n{plain}")),
+            Taint::Internal
+        );
+        assert_eq!(
+            sink_taint(&format!(
+                "def other():\n    from aiohttp import web\n{plain}"
+            )),
+            Taint::Source
+        );
+        assert_eq!(
+            sink_taint(&format!("@app.route('/')\n{plain}")),
+            Taint::Source
+        );
+        // `from urllib import request` is a module, not web input.
+        assert_eq!(
+            sink_taint("from urllib import request\ndef f(u):\n    sink(request.urlopen(u))\n"),
+            Taint::Internal
+        );
+        // `self.request` follows the same rule; `self.request_timeout` is not it.
+        let field = "class S:\n    def send(self):\n        sink(self.request.url)\n";
+        assert_eq!(sink_taint(field), Taint::Internal);
+        assert_eq!(
+            sink_taint(&format!("import tornado\n{field}")),
+            Taint::Source
+        );
+        assert_eq!(
+            sink_taint(
+                "import tornado\nclass S:\n    def send(self):\n        sink(self.request_timeout)\n"
+            ),
+            Taint::Internal
+        );
+        // `environ` is unconditional.
+        assert_eq!(
+            sink_taint("def app(environ, start_response):\n    sink(environ['PATH_INFO'])\n"),
+            Taint::Source
+        );
     }
 
     #[test]
