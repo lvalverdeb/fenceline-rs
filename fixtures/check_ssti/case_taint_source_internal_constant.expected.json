@@ -5,12 +5,6 @@
       "severity": "HIGH",
       "confidence": "HIGH",
       "line": 8
-    },
-    {
-      "cwe_id": "CWE-1336",
-      "severity": "HIGH",
-      "confidence": "MEDIUM",
-      "line": 12
     }
   ]
 }

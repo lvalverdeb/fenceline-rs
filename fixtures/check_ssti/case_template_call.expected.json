@@ -3,8 +3,8 @@
     {
       "cwe_id": "CWE-1336",
       "severity": "HIGH",
-      "confidence": "MEDIUM",
-      "line": 1
+      "confidence": "HIGH",
+      "line": 7
     }
   ]
 }

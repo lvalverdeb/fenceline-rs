@@ -94,7 +94,6 @@ pub fn checks() -> Vec<Check> {
             check_insufficient_logging,
             Raw
         ),
-        check!("Timing Attack (CWE-208)", check_timing_attack, CodeOnly),
         check!(
             "Sensitive Exposure (CWE-200)",
             check_sensitive_exposure,
@@ -104,6 +103,7 @@ pub fn checks() -> Vec<Check> {
         check!("Resource Limits (CWE-770)", check_resource_limits, Raw),
         check!("Insecure Random (CWE-338)", check_insecure_random, Raw),
         check!("SSTI (CWE-1336)", check_ssti, Raw),
+        check!("Timing Attack (CWE-208)", check_timing_attack, Raw),
         check!("XSS via mark_safe (CWE-79)", check_unsafe_markup, Raw),
         check!("CRLF Injection (CWE-93)", check_crlf, Raw),
         check!("LDAP Injection (CWE-90)", check_ldap, CodeOnly),

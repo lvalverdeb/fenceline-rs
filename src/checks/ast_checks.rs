@@ -363,6 +363,21 @@ pub fn check_except_pass(
 
 // ── check_pandas_eval (CWE-94) ───────────────────────────────────────────
 
+/// `session.query(Model)` / `db_session.query(cls)`: the receiver is a
+/// session or the first argument is a class, so this is an ORM query, not
+/// `DataFrame.query(expr)` -- mirrors `ast_checks._is_sqlalchemy_query`.
+fn is_sqlalchemy_query(c: &crate::analysis::CallRec) -> bool {
+    let receiver = c.full_attr.rsplit_once('.').map(|(r, _)| r).unwrap_or("");
+    if receiver.split('.').any(|seg| seg.ends_with("session")) {
+        return true;
+    }
+    c.first_arg_dotted
+        .as_deref()
+        .and_then(|d| d.rsplit('.').next())
+        .and_then(|last| last.chars().next())
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
 pub fn check_pandas_eval(
     _path: &Path,
     pk: &str,
@@ -385,6 +400,9 @@ pub fn check_pandas_eval(
         } else if matches!(c.full_attr.rsplit('.').next(), Some("eval") | Some("query"))
             && c.full_attr.contains('.')
         {
+            if is_sqlalchemy_query(c) {
+                continue;
+            }
             (
                 "Code Injection (DataFrame eval/query)",
                 Severity::High,
@@ -916,6 +934,7 @@ pub fn check_ssti(
         .calls
         .iter()
         .filter(|c| c.call_name == "Template" || c.call_name == "from_string")
+        .filter(|c| matches!(c.data_taint, Taint::Source | Taint::Caller))
         .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(
@@ -1958,10 +1977,11 @@ static PASSWORD_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)password|passwd|pwd").unwrap());
 static NOT_A_SECRET_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(field|header|name|param|prefix|suffix|type|kind|url|hint|label|help|placeholder|regex|pattern|length|len|path|file|hash_algorithm|algorithm|salt)$",
+        r"(?i)(?:^|_)(?:field|name|param|prefix|suffix|type|kind|url|uri|hint|label|help|placeholder|regex|pattern|length|len|path|file|algorithm|salt|provider|status|id)(?:_|$)|header$|^(?:conf|key|data|storage|attr|setting|option)_",
     )
     .unwrap()
 });
+
 static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)your[-_ ]|placeholder|example|change[-_ ]?me|xxxx|\*\*\*\*|<[^>]+>|^\.\.\.$|dummy|sample|insert[-_ ]|fill[-_ ]?in|redacted|^\$\{|^%\(|%s|\{",
@@ -2043,7 +2063,8 @@ fn classify_secret(name: &str, value: &str) -> Option<(Severity, Confidence, Str
     if value.chars().count() < 4
         || LITERAL_WORDS.contains(&value)
         || CONSTANT_NAME_RE.is_match(value)
-        || normalised(value) == normalised(name)
+        // aliases = {"secretsmanager": "secrets-manager"}: a name, not a credential.
+        || (normalised(value) == normalised(name) && !value.contains(' '))
     {
         return None;
     }
@@ -2054,7 +2075,9 @@ fn classify_secret(name: &str, value: &str) -> Option<(Severity, Confidence, Str
     } else {
         (Severity::High, "Hardcoded secret")
     };
-    if PLACEHOLDER_RE.is_match(value) {
+    // SECRET_KEY = "secret key": a phrase that names itself is still the
+    // default a forgotten deployment runs with.
+    if PLACEHOLDER_RE.is_match(value) || normalised(value) == normalised(name) {
         return Some((
             severity,
             Confidence::Medium,
@@ -2177,6 +2200,64 @@ pub fn check_tempfile(
                 "",
             ));
         }
+    }
+    results
+}
+
+// ── check_timing_attack (CWE-208), on comparisons rather than lines ──────
+
+static TIMING_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|_)(?:password|passwd|pwd|secret|token|auth|api_key|apikey|signature|otp)(?:_|$)",
+    )
+    .unwrap()
+});
+/// A name that describes a secret rather than holding one: auth_type, token_kind.
+static TIMING_DESCRIPTOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|_)(?:type|kind|provider|scheme|version|status|mode|method|name|field|url|uri|id|len|length|count|enabled|disabled|required)(?:_|$)",
+    )
+    .unwrap()
+});
+
+fn is_secret_name(name: &str) -> bool {
+    !name.is_empty() && TIMING_SECRET_RE.is_match(name) && !TIMING_DESCRIPTOR_RE.is_match(name)
+}
+
+/// CWE-208. `==`/`!=` between a value named like a secret and a non-empty
+/// string literal; `auth_type == "bearer"` and `token == ""` are not
+/// reported -- mirrors `ast_checks.check_timing_attack`.
+pub fn check_timing_attack(
+    _path: &Path,
+    pk: &str,
+    lines: &[String],
+    tree: Option<&ParsedFile>,
+) -> Vec<Finding> {
+    let Some(tree) = tree else { return vec![] };
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cmp in &tree.collected().eq_compares {
+        // token != "None": a sentinel test, not a secret comparison.
+        if LITERAL_WORDS.contains(&cmp.literal.as_str())
+            || !cmp.literal.chars().any(|c| c.is_alphanumeric())
+            || !is_secret_name(&cmp.name)
+        {
+            continue;
+        }
+        if !seen.insert(cmp.line) {
+            continue;
+        }
+        results.push(ast_finding(
+            "CWE-208",
+            "Timing Attack",
+            Severity::Low,
+            Confidence::Low,
+            pk,
+            lines,
+            cmp.line,
+            "String comparison with == may leak timing information for secret comparison. Use secrets.compare_digest().".to_string(),
+            "",
+        ));
     }
     results
 }

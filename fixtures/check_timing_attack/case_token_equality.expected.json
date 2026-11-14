@@ -4,7 +4,31 @@
       "cwe_id": "CWE-208",
       "severity": "LOW",
       "confidence": "LOW",
-      "line": 1
+      "line": 2
+    },
+    {
+      "cwe_id": "CWE-208",
+      "severity": "LOW",
+      "confidence": "LOW",
+      "line": 4
+    },
+    {
+      "cwe_id": "CWE-208",
+      "severity": "LOW",
+      "confidence": "LOW",
+      "line": 6
+    },
+    {
+      "cwe_id": "CWE-208",
+      "severity": "LOW",
+      "confidence": "LOW",
+      "line": 8
+    },
+    {
+      "cwe_id": "CWE-208",
+      "severity": "LOW",
+      "confidence": "LOW",
+      "line": 10
     }
   ]
 }

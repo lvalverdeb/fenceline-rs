@@ -212,39 +212,6 @@ pub fn check_supply_chain(
     results
 }
 
-// ── check_timing_attack (CWE-208) ────────────────────────────────────────
-
-static EQUALITY_QUOTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"==\s*['"]"#).unwrap());
-static SECRET_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    RegexBuilder::new(r"(?:token|secret|password|auth)")
-        .case_insensitive(true)
-        .build()
-        .unwrap()
-});
-
-pub fn check_timing_attack(
-    _path: &Path,
-    pk: &str,
-    lines: Lines,
-    _tree: Option<&ParsedFile>,
-) -> Vec<Finding> {
-    let mut results = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
-        }
-        if EQUALITY_QUOTE_RE.is_match(line) && SECRET_WORD_RE.is_match(line) {
-            results.push(finding(
-                "CWE-208", "Timing Attack", Severity::Low, Confidence::Low,
-                pk, i + 1, line.trim(),
-                "String comparison with == may leak timing information for secret comparison. Use secrets.compare_digest().".to_string(),
-                "",
-            ));
-        }
-    }
-    results
-}
-
 // ── check_sensitive_exposure (CWE-200) ───────────────────────────────────
 
 pub fn check_sensitive_exposure(

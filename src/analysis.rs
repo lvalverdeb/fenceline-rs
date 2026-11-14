@@ -165,6 +165,9 @@ pub struct CallRec {
     /// Dotted names of every positional/keyword argument that is a bare
     /// name or attribute chain (`yaml.SafeLoader` in `yaml.load(x, Loader=yaml.SafeLoader)`).
     pub arg_dotted_names: Vec<String>,
+    /// Dotted name of the first positional argument when it is a bare name
+    /// or attribute chain.
+    pub first_arg_dotted: Option<String>,
     /// `"...\r\n".format(x)`: a CRLF literal formatted with data.
     pub is_crlf_format_call: bool,
     pub has_args: bool,
@@ -247,6 +250,43 @@ pub struct PydanticFieldRec {
     pub has_constraint: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct EqCompareRec {
+    pub line: usize,
+    pub name: String,
+    pub literal: String,
+}
+
+/// The name of the value an operand denotes: `token` for `token`,
+/// `self.token`, `d["token"]`, `headers.get("token")` and `token.strip()`;
+/// `""` when there is none -- mirrors `ast_checks._compared_name`.
+fn compared_name(expr: &Expr) -> String {
+    const PASSTHROUGH: &[&str] = &[
+        "strip",
+        "lstrip",
+        "rstrip",
+        "lower",
+        "upper",
+        "casefold",
+        "decode",
+        "encode",
+        "hexdigest",
+    ];
+    match expr {
+        Expr::Name(n) => n.id.to_string(),
+        Expr::Attribute(a) => a.attr.to_string(),
+        Expr::Subscript(s) => str_const(&s.slice).unwrap_or_default(),
+        Expr::Call(c) => match c.func.as_ref() {
+            Expr::Attribute(a) if a.attr.as_str() == "get" && !c.args.is_empty() => {
+                str_const(&c.args[0]).unwrap_or_default()
+            }
+            Expr::Attribute(a) if PASSTHROUGH.contains(&a.attr.as_str()) => compared_name(&a.value),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
 #[derive(Default)]
 pub struct Collected {
     pub calls: Vec<CallRec>,
@@ -270,6 +310,9 @@ pub struct Collected {
     /// (`.format()` is recorded on the call).
     pub crlf_combos: Vec<(usize, Taint)>,
     pub excepts: Vec<ExceptRec>,
+    /// Every `x == "lit"` / `x != "lit"` operand pair (either order):
+    /// `(line, compared name, literal)` -- see `ast_checks._compared_name`.
+    pub eq_compares: Vec<EqCompareRec>,
     pub funcdefs: Vec<FuncDefRec>,
     pub assigns: Vec<AssignRec>,
     pub ann_assigns: Vec<AssignRec>,
@@ -488,6 +531,7 @@ impl<'a> Visitor for Collector<'a> {
             .map(full_attr)
             .filter(|d| !d.is_empty())
             .collect();
+        let first_arg_dotted = node.args.first().map(full_attr).filter(|d| !d.is_empty());
         let has_args = !node.args.is_empty() || !node.keywords.is_empty();
         let str_args: Vec<String> = node
             .args
@@ -612,6 +656,7 @@ impl<'a> Visitor for Collector<'a> {
             keyword_false_names,
             first_arg_str,
             arg_dotted_names,
+            first_arg_dotted,
             is_crlf_format_call,
             has_args,
             n_positional: node.args.len(),
@@ -714,6 +759,23 @@ impl<'a> Visitor for Collector<'a> {
             let line = self.li.line_number(node.start());
             self.record_secret_binding(line, &node.left, first);
             self.record_secret_binding(line, first, &node.left);
+        }
+        let line = self.li.line_number(node.start());
+        let mut operands: Vec<&Expr> = vec![&node.left];
+        operands.extend(node.comparators.iter());
+        for (op, pair) in node.ops.iter().zip(operands.windows(2)) {
+            if !matches!(op, CmpOp::Eq | CmpOp::NotEq) {
+                continue;
+            }
+            for (lit, other) in [(pair[0], pair[1]), (pair[1], pair[0])] {
+                if let Some(text) = str_const(lit) {
+                    self.out.eq_compares.push(EqCompareRec {
+                        line,
+                        name: compared_name(other),
+                        literal: text,
+                    });
+                }
+            }
         }
         self.generic_visit_expr_compare(node);
     }
