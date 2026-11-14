@@ -196,16 +196,28 @@ the binary with
 numbers, the labelling rules and `run.sh` are in the Python repository's
 [`benchmark/README.md`](https://github.com/lvalverdeb/fenceline/blob/main/benchmark/README.md).
 
+The same directory's `clean/` corpus measures the other side: precision on
+four ordinary, maintained applications (healthchecks, Netflix's dispatch,
+flaskbb, and the auth and HTTP packages of Home Assistant), where nobody
+planted anything and most alerts are wrong by base rate. Every finding of
+all three tools was adjudicated there too. At 1.9.0 fenceline is 3% precise
+on that corpus (22 true findings in 637), Bandit is 5%, and Semgrep's
+community rules report 17 findings with nothing true among them. Two
+fenceline checks account for four fifths of the noise: log injection on any
+f-string passed to a logger, and open redirect on Django's `redirect()`
+called with a URL pattern name. That is the number a team actually feels,
+and raising it is the current work (`ROADMAP.md`).
+
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- The false-positive rate on ordinary, non-vulnerable code is not measured
-  yet. The benchmark apps are built to be vulnerable, so they test recall
-  far better than noise. A library corpus (aiohttp, botocore, tornado,
-  PyYAML) is scanned for regressions and audited by hand, but it has no
-  ground truth.
+- Precision on ordinary code is 3%, and `--confidence-min high` does not
+  help, because the two noisy checks report at HIGH. The vulnerable apps
+  test recall; the clean corpus shows what a team turning fenceline on sees
+  first. Until that corpus reads above the bar set in `ROADMAP.md`, adopt
+  fenceline on an existing codebase with a baseline file.
 - Four small apps is still a small benchmark. The Django one was added so
   the cross-file analysis had a view-to-helper chain to follow, and it does,
   but intentionally vulnerable Python apps with a real service layer are
