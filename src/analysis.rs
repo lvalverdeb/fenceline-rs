@@ -16,9 +16,10 @@ use crate::taint::{Taint, TaintIndex};
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
     Arguments, CmpOp, Comprehension, Constant, ExceptHandlerExceptHandler, Expr, ExprAttribute,
-    ExprBinOp, ExprCall, ExprCompare, ExprConstant, ExprDict, ExprJoinedStr, ExprName, Keyword,
-    ModModule, Operator, Ranged, Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef,
-    StmtClassDef, StmtFunctionDef, StmtImport, StmtImportFrom, Visitor, WithItem,
+    ExprBinOp, ExprCall, ExprCompare, ExprConstant, ExprDict, ExprJoinedStr, ExprList, ExprName,
+    ExprSet, ExprTuple, Keyword, ModModule, Operator, Ranged, Stmt, StmtAnnAssign, StmtAssign,
+    StmtAsyncFunctionDef, StmtAugAssign, StmtClassDef, StmtFunctionDef, StmtImport, StmtImportFrom,
+    Visitor, WithItem,
 };
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
@@ -168,6 +169,15 @@ pub struct CallRec {
     /// Dotted name of the first positional argument when it is a bare name
     /// or attribute chain.
     pub first_arg_dotted: Option<String>,
+    /// Identifiers in the targets of the assignment this call sits in
+    /// (`token = f(x)` -> `["token"]`) -- see `ast_checks._enclosing_targets`.
+    pub assign_target_names: Vec<String>,
+    /// `["pybabel", "-d", folder]` / `[sys.executable, "-m", ...]`: a
+    /// list-form command whose program is fixed.
+    pub argv_fixed_program: bool,
+    /// String literals the first positional argument is or is bound to in
+    /// scope (`random.sample(field, n)` with `field = "abc...789"`).
+    pub first_arg_bound_strs: Vec<String>,
     /// `"...\r\n".format(x)`: a CRLF literal formatted with data.
     pub is_crlf_format_call: bool,
     pub has_args: bool,
@@ -333,10 +343,19 @@ struct Collector<'a> {
     li: &'a LineIndex,
     taint: &'a TaintIndex,
     out: Collected,
+    /// Identifiers in the targets of the assignment statement being visited.
+    assign_targets: Vec<String>,
+    /// For each enclosing list/set/tuple/comparison: whether it holds
+    /// nothing but string literals (a set of addresses, not a bind).
+    container_all_str: Vec<bool>,
     /// Start offsets of every `Compare` operand, so a `CERT_NONE` reference
     /// can be told apart from `== ssl.CERT_NONE` (a check, not a configuration).
     compare_operand_starts: HashSet<TextSize>,
 }
+
+/// `DEFAULT_BIND = ["0.0.0.0", "::"]`: a list of strings that still binds.
+static BIND_NAME_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)bind|listen").unwrap());
 
 pub fn is_false_constant(e: &Expr) -> bool {
     matches!(e, Expr::Constant(c) if matches!(c.value, Constant::Bool(false)))
@@ -532,6 +551,12 @@ impl<'a> Visitor for Collector<'a> {
             .filter(|d| !d.is_empty())
             .collect();
         let first_arg_dotted = node.args.first().map(full_attr).filter(|d| !d.is_empty());
+        let argv_fixed_program = match node.args.first() {
+            Some(Expr::List(l)) => l.elts.first(),
+            Some(Expr::Tuple(t)) => t.elts.first(),
+            _ => None,
+        }
+        .is_some_and(|first| str_const(first).is_some() || full_attr(first) == "sys.executable");
         let has_args = !node.args.is_empty() || !node.keywords.is_empty();
         let str_args: Vec<String> = node
             .args
@@ -570,6 +595,16 @@ impl<'a> Visitor for Collector<'a> {
         let is_excluded_compile =
             fa == "compile" && (is_re_compile(&node) || is_sqlalchemy_compile(&node));
         let anchor = node.start();
+        let first_arg_bound_strs: Vec<String> = match node.args.first() {
+            Some(Expr::Name(n)) => self
+                .taint
+                .bound_values(anchor, n.id.as_str())
+                .iter()
+                .filter_map(str_const)
+                .collect(),
+            Some(a) => str_const(a).into_iter().collect(),
+            None => Vec::new(),
+        };
         let data_taint = self.taint.classify(
             anchor,
             node.args
@@ -657,6 +692,9 @@ impl<'a> Visitor for Collector<'a> {
             first_arg_str,
             arg_dotted_names,
             first_arg_dotted,
+            assign_target_names: self.assign_targets.clone(),
+            argv_fixed_program,
+            first_arg_bound_strs,
             is_crlf_format_call,
             has_args,
             n_positional: node.args.len(),
@@ -777,7 +815,9 @@ impl<'a> Visitor for Collector<'a> {
                 }
             }
         }
+        self.container_all_str.push(true);
         self.generic_visit_expr_compare(node);
+        self.container_all_str.pop();
     }
 
     fn visit_stmt_import(&mut self, node: StmtImport) {
@@ -820,7 +860,8 @@ impl<'a> Visitor for Collector<'a> {
 
     fn visit_expr_constant(&mut self, node: ExprConstant) {
         if let Constant::Str(s) = &node.value {
-            if s == "0.0.0.0" {
+            let bound_to_bind = self.assign_targets.iter().any(|n| BIND_NAME_RE.is_match(n));
+            if s == "0.0.0.0" && (self.container_all_str.last() != Some(&true) || bound_to_bind) {
                 self.out
                     .bind_all_lines
                     .push(self.li.line_number(node.start()));
@@ -908,7 +949,9 @@ impl<'a> Visitor for Collector<'a> {
 
     fn visit_stmt_assign(&mut self, node: StmtAssign) {
         let line = self.li.line_number(node.start());
+        self.assign_targets.clear();
         for t in &node.targets {
+            names_in_expr(t, &mut self.assign_targets);
             self.record_secret_binding(line, t, &node.value);
         }
         if let Some(v) = bool_value(&node.value) {
@@ -923,10 +966,41 @@ impl<'a> Visitor for Collector<'a> {
             });
         }
         self.generic_visit_stmt_assign(node);
+        self.assign_targets.clear();
+    }
+
+    fn visit_stmt_aug_assign(&mut self, node: StmtAugAssign) {
+        self.assign_targets.clear();
+        names_in_expr(&node.target, &mut self.assign_targets);
+        self.generic_visit_stmt_aug_assign(node);
+        self.assign_targets.clear();
+    }
+
+    fn visit_expr_list(&mut self, node: ExprList) {
+        self.container_all_str
+            .push(node.elts.iter().all(|e| str_const(e).is_some()));
+        self.generic_visit_expr_list(node);
+        self.container_all_str.pop();
+    }
+
+    fn visit_expr_tuple(&mut self, node: ExprTuple) {
+        self.container_all_str
+            .push(node.elts.iter().all(|e| str_const(e).is_some()));
+        self.generic_visit_expr_tuple(node);
+        self.container_all_str.pop();
+    }
+
+    fn visit_expr_set(&mut self, node: ExprSet) {
+        self.container_all_str
+            .push(node.elts.iter().all(|e| str_const(e).is_some()));
+        self.generic_visit_expr_set(node);
+        self.container_all_str.pop();
     }
 
     fn visit_stmt_ann_assign(&mut self, node: StmtAnnAssign) {
         let line = self.li.line_number(node.start());
+        self.assign_targets.clear();
+        names_in_expr(&node.target, &mut self.assign_targets);
         if let Some(value) = node.value.as_deref() {
             self.record_secret_binding(line, &node.target, value);
         }
@@ -944,6 +1018,7 @@ impl<'a> Visitor for Collector<'a> {
             });
         }
         self.generic_visit_stmt_ann_assign(node);
+        self.assign_targets.clear();
     }
 
     fn visit_expr_dict(&mut self, node: ExprDict) {
@@ -981,6 +1056,8 @@ fn collect(tree: &ModModule, li: &LineIndex, taint: &TaintIndex) -> Collected {
         li,
         taint,
         out: Collected::default(),
+        assign_targets: Vec::new(),
+        container_all_str: Vec::new(),
         compare_operand_starts: HashSet::new(),
     };
     for stmt in tree.body.clone() {

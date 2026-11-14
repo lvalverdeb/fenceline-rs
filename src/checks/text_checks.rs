@@ -99,8 +99,8 @@ pub fn check_xxe(_path: &Path, pk: &str, lines: Lines, tree: Option<&ParsedFile>
         .map(|alias| Regex::new(&format!(r"\b{}\.", regex::escape(&alias))).unwrap());
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if skip(line) {
-            continue;
+        if skip(line) || line.contains("xml.sax.saxutils") {
+            continue; // saxutils is the escaping helper, not a parser
         }
         let lxml_hit = lxml_pattern.as_ref().is_some_and(|p| p.is_match(line));
         if XXE_RE.is_match(line) || lxml_hit {

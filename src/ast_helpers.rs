@@ -205,6 +205,13 @@ impl Visitor for DiagnosticVisitor {
         if full == "warnings.warn" || has_log_like_token(&full) {
             self.found = true;
         }
+        // traceback.print_exc() and friends surface the exception on stderr.
+        if matches!(
+            full.rsplit('.').next().unwrap_or(""),
+            "print_exc" | "print_exception" | "print_stack" | "format_exc"
+        ) {
+            self.found = true;
+        }
         self.generic_visit_expr_call(node);
     }
 

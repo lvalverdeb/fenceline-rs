@@ -122,6 +122,20 @@ const CLEAN_CALLS: &[&str] = &[
     "urllib.parse.quote_plus",
     "html.escape",
     "re.escape",
+    // Escaping and encoding helpers: their output is safe for the
+    // context they target, and that context is where it is used.
+    "escape",
+    "markupsafe.escape",
+    "django.utils.html.escape",
+    "conditional_escape",
+    "django.utils.html.conditional_escape",
+    "format_html",
+    "django.utils.html.format_html",
+    "quote",
+    "quote_plus",
+    "urlencode",
+    "urllib.parse.urlencode",
+    "django.utils.http.urlencode",
     // Route builders: a same-site URL from a route name and escaped parameters.
     "url_for",
     "flask.url_for",
@@ -617,9 +631,38 @@ fn is_view_capture(dotted: &str) -> bool {
 /// sessions (`session.query(M)`, `session.execute(stmt)`,
 /// `session.scalars(stmt)`, `session.get(M, x)`) -- mirrors
 /// `taint._is_orm_lookup`.
+/// Introspection attributes: a class or module name, never request content.
+const CLEAN_ATTRS: &[&str] = &[
+    "__name__",
+    "__qualname__",
+    "__module__",
+    "__class__",
+    "__doc__",
+];
+
+/// `Topic`, `UserModel`: a class name (not `CONF_X`, not `request`).
+fn is_class_name(seg: &str) -> bool {
+    let mut chars = seg.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+}
+
 fn is_orm_lookup(dotted: &str) -> bool {
     let parts: Vec<&str> = dotted.split('.').collect();
-    if dotted.contains(".objects.") || (parts.len() >= 2 && parts[parts.len() - 1] == "query") {
+    let last = parts[parts.len() - 1];
+    if dotted.contains(".objects.") || (parts.len() >= 2 && last == "query") {
+        return true;
+    }
+    if matches!(last, "first_or_404" | "get_or_404" | "one_or_404") {
+        return true;
+    }
+    if parts.len() >= 2
+        && is_class_name(parts[0])
+        && (last.starts_with("get")
+            || last.starts_with("find")
+            || last.starts_with("lookup")
+            || last.ends_with("_or_404"))
+    {
         return true;
     }
     parts.len() >= 3
@@ -1405,6 +1448,9 @@ impl<'s> Classifier<'s> {
             Expr::Constant(_) => Taint::Clean,
             Expr::Name(n) => self.name(n.id.as_str(), depth),
             Expr::Attribute(a) => {
+                if CLEAN_ATTRS.contains(&a.attr.as_str()) {
+                    return Taint::Clean;
+                }
                 let dotted = expr_dotted_name(node);
                 if !dotted.is_empty() && self.source_chain(&dotted) {
                     return Taint::Source;

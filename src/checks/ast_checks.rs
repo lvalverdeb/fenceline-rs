@@ -118,6 +118,51 @@ const RANDOM_UNSAFE_FNS: &[&str] = &[
     "randbytes",
 ];
 
+/// A value named like a credential: what a weak hash or a weak random
+/// source must not produce -- mirrors `ast_checks._CREDENTIAL_NAME_RE`.
+static CREDENTIAL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|_)(?:password|passwd|pwd|secret|token|api_key|apikey|key|otp|credential|credentials|auth|session|nonce|salt|signature|csrf|pin)(?:_|$)",
+    )
+    .unwrap()
+});
+/// Character sets a token is drawn from: `random.choices(string.ascii_letters, k=16)`.
+const ALPHABET_NAMES: &[&str] = &[
+    "ascii_letters",
+    "ascii_lowercase",
+    "ascii_uppercase",
+    "digits",
+    "hexdigits",
+    "octdigits",
+    "letters",
+    "printable",
+    "punctuation",
+    "chars",
+    "charset",
+    "alphabet",
+    "symbols",
+];
+const NOT_CREDENTIAL_NOTE: &str = " — neither the inputs nor the assigned name look like a credential; confirm the value is not used as one.";
+
+/// `"abc...XYZ0123456789"`: a character set, not a message -- mirrors
+/// `ast_checks._looks_like_alphabet`.
+fn looks_like_alphabet(text: &str) -> bool {
+    text.chars().count() >= 10 && !text.contains(' ') && text.chars().any(|c| c.is_alphanumeric())
+}
+
+/// The call's arguments or the name its result is bound to are named like
+/// a credential -- mirrors `ast_checks._credential_context`.
+fn credential_context(c: &crate::analysis::CallRec) -> bool {
+    c.arg_names
+        .iter()
+        .chain(c.assign_target_names.iter())
+        .any(|n| CREDENTIAL_NAME_RE.is_match(n))
+}
+
+/// CWE-338. HIGH when the call plainly produces a secret (credential-like
+/// binding, drawn from a character set, `getrandbits`/`randbytes`);
+/// MEDIUM for jitter, sampling and shuffling -- mirrors
+/// `ast_checks.check_insecure_random`.
 pub fn check_insecure_random(
     _path: &Path,
     pk: &str,
@@ -137,17 +182,28 @@ pub fn check_insecure_random(
         })
         .map(|c| {
             let base = c.full_attr.rsplit('.').next().unwrap_or("");
+            let from_alphabet = matches!(base, "choice" | "choices" | "sample")
+                && (c.arg_names.iter().any(|n| ALPHABET_NAMES.contains(&n.as_str()))
+                    || c.first_arg_bound_strs.iter().any(|s| looks_like_alphabet(s)));
+            let (confidence, note) = if matches!(base, "getrandbits" | "randbytes")
+                || from_alphabet
+                || credential_context(c)
+            {
+                (Confidence::High, "")
+            } else {
+                (Confidence::Medium, NOT_CREDENTIAL_NOTE)
+            };
             Finding {
                 cwe_id: "CWE-338",
                 cwe_name: "Insecure Randomness",
                 severity: Severity::Low,
-                confidence: Confidence::High,
+                confidence,
                 package: String::new(),
                 file: pk.to_string(),
                 line: c.line,
                 code_snippet: code_at(lines, c.line),
                 description: format!(
-                    "random.{base}() uses Mersenne Twister (not crypto-secure). Use secrets module for security-sensitive contexts."
+                    "random.{base}() uses Mersenne Twister (not crypto-secure). Use secrets module for security-sensitive contexts.{note}"
                 ),
                 zero_day_relevance: "",
             }
@@ -853,6 +909,13 @@ pub fn check_command_injection(
         if matched.is_none() && !shell {
             continue;
         }
+        // A fixed program and no shell: internal values can at most be arguments.
+        if !shell
+            && call.argv_fixed_program
+            && !matches!(call.command_taint, Taint::Source | Taint::Caller)
+        {
+            continue;
+        }
         let Some((confidence, note)) = confidence_for(call.command_taint) else {
             continue;
         };
@@ -1010,16 +1073,21 @@ pub fn check_weak_hash(
             continue;
         }
         let fa = call.full_attr.as_str();
+        let (confidence, note) = if credential_context(call) {
+            (Confidence::High, "")
+        } else {
+            (Confidence::Medium, NOT_CREDENTIAL_NOTE)
+        };
         if dotted_matches(fa, "hashlib.md5") || dotted_matches(fa, "hashlib.sha1") {
             results.push(ast_finding(
                 "CWE-328",
                 "Weak Cryptographic Hash",
                 Severity::Medium,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 call.line,
-                "Use of MD5/SHA-1 — collision-prone, use SHA-256 or better.".to_string(),
+                format!("Use of MD5/SHA-1 — collision-prone, use SHA-256 or better.{note}"),
                 "",
             ));
         } else if dotted_matches(fa, "hashlib.new")
@@ -1032,14 +1100,15 @@ pub fn check_weak_hash(
                 "CWE-328",
                 "Weak Cryptographic Hash",
                 Severity::Medium,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 call.line,
-                "hashlib.new() with a weak algorithm name (MD5/MD4/MD2/SHA-1) — \
+                format!(
+                    "hashlib.new() with a weak algorithm name (MD5/MD4/MD2/SHA-1) — \
 same collision risk as calling hashlib.md5()/sha1() directly, \
-just reached through the generic constructor. Use SHA-256 or better."
-                    .to_string(),
+just reached through the generic constructor. Use SHA-256 or better.{note}"
+                ),
                 "",
             ));
         }
@@ -1072,6 +1141,28 @@ fn is_same_site_path(lead: &str) -> bool {
 /// path or, in Django, a URL pattern name with URL parameters) and one whose
 /// destination starts with a literal path (`"/tasks/" + task_id`) are not
 /// open redirects.
+/// The request's own path (`redirect(request.path)`,
+/// `redirect(request.get_full_path())`): a redirect back to it stays on
+/// the site -- mirrors `ast_checks._is_request_own_path`.
+fn is_request_own_path(c: &crate::analysis::CallRec) -> bool {
+    const OWN_PATH: &[&str] = &[
+        "path",
+        "path_info",
+        "full_path",
+        "get_full_path",
+        "script_root",
+        "url_rule",
+    ];
+    let dotted = c
+        .first_arg_dotted
+        .as_deref()
+        .or(c.first_arg_call_full_attr.as_deref())
+        .unwrap_or("");
+    let mut parts = dotted.rsplit('.');
+    let last = parts.next().unwrap_or("");
+    parts.next() == Some("request") && OWN_PATH.contains(&last)
+}
+
 pub fn check_open_redirect(
     _path: &Path,
     pk: &str,
@@ -1086,6 +1177,7 @@ pub fn check_open_redirect(
         .filter(|c| REDIRECT_CALLS.contains(&c.call_name.as_str()))
         .filter(|c| c.first_arg_str.is_none())
         .filter(|c| !c.data_leading_str.as_deref().is_some_and(is_same_site_path))
+        .filter(|c| !is_request_own_path(c))
         .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(
@@ -1390,6 +1482,7 @@ pub fn check_resource_limits(
         .iter()
         .filter(|c| !c.func_is_bare_name && c.call_name == "read" && !c.has_args)
         .filter(|c| !STREAMING_CONTEXT_RE.is_match(&code_at(lines, c.line)))
+        .filter(|c| matches!(c.receiver_taint, Some(Taint::Source | Taint::Caller)))
         .filter_map(|c| {
             let (confidence, note) = confidence_for(c.receiver_taint.unwrap_or(Taint::Internal))?;
             Some(ast_finding(
@@ -1829,9 +1922,20 @@ pub fn check_legacy_pycrypto(
 // ── Logging and library-loading calls (converted from line regexes so a
 // call whose arguments continue on later lines is still matched) ──────────
 
+/// In message text: whole words, so "tokeniser" and "tokens" do not count.
 static SECRET_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
     RegexBuilder::new(
-        r"password|passwd|secret|token|api_key|apikey|auth_token|access_key|private_key|credential",
+        r"\b(?:password|passwd|secret|token|api_key|apikey|auth_token|access_key|private_key|credential|credentials)\b",
+    )
+    .case_insensitive(true)
+    .build()
+    .unwrap()
+});
+/// In identifiers: whole `_`-separated segments (`self.password`,
+/// `user.api_key`), not `model_token_limit` or `tokeniser`.
+static SECRET_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    RegexBuilder::new(
+        r"(?:^|_)(?:password|passwd|secret|secrets|token|tokens|api_key|apikey|auth_token|access_key|private_key|credential|credentials)(?:_|$)",
     )
     .case_insensitive(true)
     .build()
@@ -1868,7 +1972,10 @@ pub fn check_log_secrets(
         if !is_logging_call(c) {
             continue;
         }
-        let (confidence, description) = if c.arg_names.iter().any(|n| SECRET_KEYWORD_RE.is_match(n))
+        let (confidence, description) = if c
+            .arg_names
+            .iter()
+            .any(|n| SECRET_IDENT_RE.is_match(n) && !DESCRIPTOR_NAME_RE.is_match(n))
         {
             (
                 Confidence::High,
@@ -1918,6 +2025,11 @@ pub fn check_log_injection(
         })
         .filter_map(|c| confidence_for(c.fstring_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
+            let confidence = if c.fstring_taint == Taint::Caller {
+                Confidence::Medium
+            } else {
+                confidence
+            };
             ast_finding(
                 "CWE-117",
                 "Log Injection / Forging",
@@ -2212,16 +2324,17 @@ static TIMING_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-/// A name that describes a secret rather than holding one: auth_type, token_kind.
-static TIMING_DESCRIPTOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+/// A name that describes a secret rather than holding one: auth_type,
+/// token_kind, model_token_limit.
+static DESCRIPTOR_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:^|_)(?:type|kind|provider|scheme|version|status|mode|method|name|field|url|uri|id|len|length|count|enabled|disabled|required)(?:_|$)",
+        r"(?i)(?:^|_)(?:type|kind|provider|scheme|version|status|mode|method|name|field|url|uri|id|len|length|count|limit|max|min|size|ttl|timeout|expiry|expires|enabled|disabled|required)(?:_|$)",
     )
     .unwrap()
 });
 
 fn is_secret_name(name: &str) -> bool {
-    !name.is_empty() && TIMING_SECRET_RE.is_match(name) && !TIMING_DESCRIPTOR_RE.is_match(name)
+    !name.is_empty() && TIMING_SECRET_RE.is_match(name) && !DESCRIPTOR_NAME_RE.is_match(name)
 }
 
 /// CWE-208. `==`/`!=` between a value named like a secret and a non-empty
