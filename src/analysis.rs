@@ -8,8 +8,9 @@
 
 use crate::ast_helpers::{
     LineIndex, ScopedCall, call_name, full_attr, has_dynamic_arg, is_re_compile,
-    is_sqlalchemy_compile, iter_calls_in_scope, resolve_dotted, sql_shape, walk_arguments_children,
-    walk_comprehension_children, walk_keyword_children, walk_withitem_children,
+    is_sqlalchemy_compile, iter_calls_in_scope, leading_str, resolve_dotted, sql_shape,
+    walk_arguments_children, walk_comprehension_children, walk_keyword_children,
+    walk_withitem_children,
 };
 use crate::taint::{Taint, TaintIndex};
 use rustpython_ast::text_size::TextSize;
@@ -198,6 +199,10 @@ pub struct CallRec {
     pub receiver_taint: Option<Taint>,
     /// `ast_helpers::sql_shape` of the first positional argument.
     pub first_arg_sql_shape: Option<&'static str>,
+    /// `ast_helpers::leading_str` of the first expression the call is fed
+    /// (`_call_data(node)[0]`: the first positional argument, else the first
+    /// keyword value).
+    pub data_leading_str: Option<String>,
     /// String literals passed directly as arguments plus the literal parts
     /// of f-string arguments -- mirrors `ast_checks._string_fragments`.
     pub str_fragments: Vec<String>,
@@ -540,6 +545,11 @@ impl<'a> Visitor for Collector<'a> {
         };
         // Mirrors `ast_checks._sql_shape_at`: look through a local name to
         // the values assigned to it (`q = "..." % x; execute(q)`).
+        let data_leading_str = node
+            .args
+            .first()
+            .or_else(|| node.keywords.first().map(|kw| &kw.value))
+            .and_then(leading_str);
         let first_arg_sql_shape = node.args.first().and_then(|a| {
             sql_shape(a).or_else(|| match a {
                 Expr::Name(n) => self
@@ -602,6 +612,7 @@ impl<'a> Visitor for Collector<'a> {
             first_arg_taint,
             receiver_taint,
             first_arg_sql_shape,
+            data_leading_str,
             str_fragments,
             positional_fstring,
         });

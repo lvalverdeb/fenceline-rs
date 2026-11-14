@@ -187,12 +187,11 @@ comparison against Bandit and Semgrep on four intentionally vulnerable apps
 adjudicated by hand. At 1.6.0 fenceline sat between the two (76% precision,
 53% recall against Bandit's 90% / 82% on the first three apps); the gap was
 three checks, and closing them put 1.8.0 at 92% precision and 94% recall
-there. On all four apps the current main is at 86% precision and 93% recall,
+there. On all four apps the current main is at 92% precision and 93% recall,
 against Bandit's 89% / 76% and Semgrep's 99% / 33% on the same ground truth,
-and 97% precision at `--confidence-min high`; the drop is sixteen
-check-shaped false positives on django.nV, listed in the benchmark README.
-This port produces the identical 239 findings there, so its numbers are the
-same; run it against the binary with
+and 97% precision at `--confidence-min high`. This port produces the
+identical 223 findings there, so its numbers are the same; run it against
+the binary with
 `FENCELINE_CMD=target/release/fenceline ../fenceline/benchmark/run.sh`. The
 numbers, the labelling rules and `run.sh` are in the Python repository's
 [`benchmark/README.md`](https://github.com/lvalverdeb/fenceline/blob/main/benchmark/README.md).

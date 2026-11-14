@@ -6,9 +6,9 @@
 
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
-    Arguments, Comprehension, Expr, ExprCall, ExprLambda, Keyword, ModModule, Operator, Stmt,
-    StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef, StmtAsyncWith, StmtClassDef, StmtFunctionDef,
-    StmtImport, StmtImportFrom, StmtWith, Visitor, WithItem,
+    Arguments, Comprehension, Constant, Expr, ExprCall, ExprLambda, Keyword, ModModule, Operator,
+    Stmt, StmtAnnAssign, StmtAssign, StmtAsyncFunctionDef, StmtAsyncWith, StmtClassDef,
+    StmtFunctionDef, StmtImport, StmtImportFrom, StmtWith, Visitor, WithItem,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -529,6 +529,31 @@ fn all_constant(e: &Expr) -> bool {
         Expr::Constant(_) => true,
         Expr::BinOp(b) => all_constant(&b.left) && all_constant(&b.right),
         _ => false,
+    }
+}
+
+/// The string literal a built-up string starts with: `"/a/" + x`,
+/// `f"/a/{x}"`, `"/a/%s" % x` and `"/a/{}".format(x)` all give `"/a/"`.
+/// `None` when the expression does not start with a literal. Mirrors
+/// `ast_checks._leading_str`.
+pub fn leading_str(expr: &Expr) -> Option<String> {
+    let mut expr = expr;
+    loop {
+        match expr {
+            Expr::Constant(c) => {
+                return match &c.value {
+                    Constant::Str(s) => Some(s.to_string()),
+                    _ => None,
+                };
+            }
+            Expr::BinOp(b) if matches!(b.op, Operator::Add | Operator::Mod) => expr = &b.left,
+            Expr::JoinedStr(j) if !j.values.is_empty() => expr = &j.values[0],
+            Expr::Call(c) => match c.func.as_ref() {
+                Expr::Attribute(a) if a.attr.as_str() == "format" => expr = &a.value,
+                _ => return None,
+            },
+            _ => return None,
+        }
     }
 }
 

@@ -1039,6 +1039,18 @@ const REDIRECT_CALLS: &[&str] = &[
     "HTTPFound",
 ];
 
+/// A redirect target that starts with a literal absolute path
+/// (`"/account/" + user_id`) can only land on the same site. A bare `"/"`
+/// or `"\\"` prefix does not count: browsers read `///host` and `/\\host` as
+/// scheme-relative URLs. Mirrors `ast_checks._is_same_site_path`.
+fn is_same_site_path(lead: &str) -> bool {
+    let mut chars = lead.chars();
+    chars.next() == Some('/') && matches!(chars.next(), Some(c) if c != '/' && c != '\\')
+}
+
+/// CWE-601. A `redirect(...)`/`Redirect(...)` call fed a non-literal
+/// destination. A redirect to a fixed path and one whose destination starts
+/// with a literal path (`"/tasks/" + task_id`) are not open redirects.
 pub fn check_open_redirect(
     _path: &Path,
     pk: &str,
@@ -1051,6 +1063,7 @@ pub fn check_open_redirect(
         .calls
         .iter()
         .filter(|c| REDIRECT_CALLS.contains(&c.call_name.as_str()))
+        .filter(|c| !c.data_leading_str.as_deref().is_some_and(is_same_site_path))
         .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(
@@ -1807,9 +1820,14 @@ static SHARED_LIB_RE: LazyLock<Regex> =
 
 /// `x.info(...)`/`x.debug(...)`/... on anything but the `warnings` module,
 /// whose `warn` goes to stderr, not a log (`_warnings=warnings`
-/// default-argument idiom included) -- mirrors `ast_checks._is_logging_call`.
+/// default-argument idiom included), and Django's `django.contrib.messages`,
+/// whose `warning`/`error` queue a flash message for the next response --
+/// mirrors `ast_checks._is_logging_call`.
 fn is_logging_call(c: &crate::analysis::CallRec) -> bool {
     if c.func_is_bare_name || !LOGGING_METHOD_NAMES.contains(&c.call_name.as_str()) {
+        return false;
+    }
+    if c.full_attr.starts_with("django.contrib.messages.") {
         return false;
     }
     let root = c.full_attr.split('.').next().unwrap_or("");
