@@ -208,6 +208,9 @@ pub struct CallRec {
     pub str_fragments: Vec<String>,
     /// A positional argument is an f-string with at least one interpolation.
     pub positional_fstring: bool,
+    /// Taint of the interpolated expressions of every positional f-string
+    /// argument (`_fstring_values`); `Clean` when there are none.
+    pub fstring_taint: Taint,
 }
 
 pub struct ExceptRec {
@@ -587,6 +590,20 @@ impl<'a> Visitor for Collector<'a> {
         let positional_fstring = node.args.iter().any(|a| {
             matches!(a, Expr::JoinedStr(j) if j.values.iter().any(|v| matches!(v, Expr::FormattedValue(_))))
         });
+        let fstring_values: Vec<&Expr> = node
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                Expr::JoinedStr(j) => Some(j.values.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|v| match v {
+                Expr::FormattedValue(f) => Some(f.value.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let fstring_taint = self.taint.classify(anchor, fstring_values);
 
         self.out.calls.push(CallRec {
             line,
@@ -615,6 +632,7 @@ impl<'a> Visitor for Collector<'a> {
             data_leading_str,
             str_fragments,
             positional_fstring,
+            fstring_taint,
         });
         self.generic_visit_expr_call(node);
     }

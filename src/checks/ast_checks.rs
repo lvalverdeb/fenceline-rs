@@ -1049,8 +1049,10 @@ fn is_same_site_path(lead: &str) -> bool {
 }
 
 /// CWE-601. A `redirect(...)`/`Redirect(...)` call fed a non-literal
-/// destination. A redirect to a fixed path and one whose destination starts
-/// with a literal path (`"/tasks/" + task_id`) are not open redirects.
+/// destination. A redirect whose first argument is a string literal (a fixed
+/// path or, in Django, a URL pattern name with URL parameters) and one whose
+/// destination starts with a literal path (`"/tasks/" + task_id`) are not
+/// open redirects.
 pub fn check_open_redirect(
     _path: &Path,
     pk: &str,
@@ -1063,6 +1065,7 @@ pub fn check_open_redirect(
         .calls
         .iter()
         .filter(|c| REDIRECT_CALLS.contains(&c.call_name.as_str()))
+        .filter(|c| c.first_arg_str.is_none())
         .filter(|c| !c.data_leading_str.as_deref().is_some_and(is_same_site_path))
         .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
@@ -1889,17 +1892,24 @@ pub fn check_log_injection(
     tree.collected()
         .calls
         .iter()
-        .filter(|c| is_logging_call(c) && c.positional_fstring)
-        .map(|c| {
+        .filter(|c| {
+            is_logging_call(c)
+                && c.positional_fstring
+                && matches!(c.fstring_taint, Taint::Source | Taint::Caller)
+        })
+        .filter_map(|c| confidence_for(c.fstring_taint).map(|t| (c, t)))
+        .map(|(c, (confidence, note))| {
             ast_finding(
                 "CWE-117",
                 "Log Injection / Forging",
                 Severity::Low,
-                Confidence::High,
+                confidence,
                 pk,
                 lines,
                 c.line,
-                "f-string in logger call — may embed newlines/CRLF from user input, forging log entries.".to_string(),
+                format!(
+                    "f-string in logger call interpolates request data — a value carrying a newline or CRLF forges a log entry.{note}"
+                ),
                 "",
             )
         })

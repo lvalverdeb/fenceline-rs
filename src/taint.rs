@@ -122,6 +122,15 @@ const CLEAN_CALLS: &[&str] = &[
     "urllib.parse.quote_plus",
     "html.escape",
     "re.escape",
+    // Route builders: a same-site URL from a route name and escaped parameters.
+    "url_for",
+    "flask.url_for",
+    "reverse",
+    "reverse_lazy",
+    "django.urls.reverse",
+    "django.urls.reverse_lazy",
+    "resolve_url",
+    "django.shortcuts.resolve_url",
 ];
 const CLEAN_METHODS: &[&str] = &[
     "isdigit",
@@ -602,11 +611,23 @@ fn is_view_capture(dotted: &str) -> bool {
         || dotted.starts_with("self.args.")
 }
 
-/// `Model.objects.get(pk=x)` and the rest of a Django manager chain: the
-/// arguments pick a row, the result is stored data, not the request's --
-/// mirrors `taint._is_orm_lookup`.
+/// A database lookup: the arguments pick rows, the result is stored data,
+/// not the request's. Django managers (`Model.objects.get(pk=x)`),
+/// Flask-SQLAlchemy models (`Model.query.filter_by(id=x)`) and SQLAlchemy
+/// sessions (`session.query(M)`, `session.execute(stmt)`,
+/// `session.scalars(stmt)`, `session.get(M, x)`) -- mirrors
+/// `taint._is_orm_lookup`.
 fn is_orm_lookup(dotted: &str) -> bool {
-    dotted.contains(".objects.")
+    let parts: Vec<&str> = dotted.split('.').collect();
+    if dotted.contains(".objects.") || (parts.len() >= 2 && parts[parts.len() - 1] == "query") {
+        return true;
+    }
+    parts.len() >= 3
+        && parts[parts.len() - 2].ends_with("session")
+        && matches!(
+            parts[parts.len() - 1],
+            "execute" | "scalars" | "scalar" | "get"
+        )
 }
 
 /// Does the function receive a request directly: a route-decorated function,
@@ -1551,6 +1572,50 @@ mod tests {
             Taint::Source
         );
         assert_eq!(sink_taint("def helper(q):\n    sink(q)\n"), Taint::Internal);
+    }
+
+    #[test]
+    fn orm_lookups_and_route_builders_are_not_request_data() {
+        let flask = "from flask import request\n";
+        assert_eq!(
+            sink_taint(&format!(
+                "{flask}def v(tid):\n    sink(Topic.query.filter_by(id=tid).first().url)\n"
+            )),
+            Taint::Internal
+        );
+        assert_eq!(
+            sink_taint(&format!(
+                "{flask}def v(tid):\n    sink(db.session.get(Topic, tid))\n"
+            )),
+            Taint::Internal
+        );
+        assert_eq!(
+            sink_taint(&format!(
+                "{flask}def v(tid):\n    sink(db_session.query(M).filter(M.id == tid))\n"
+            )),
+            Taint::Internal
+        );
+        assert_eq!(
+            sink_taint(&format!(
+                "{flask}def v(tid):\n    sink(session.execute(stmt, {{'id': tid}}))\n"
+            )),
+            Taint::Internal
+        );
+        // `request.query` is still the query string, not a lookup.
+        assert_eq!(
+            sink_taint("import aiohttp\ndef v(request):\n    sink(request.query.get('x'))\n"),
+            Taint::Source
+        );
+        assert_eq!(
+            sink_taint(&format!(
+                "{flask}def v(tid):\n    sink(url_for('topic', id=request.args['t']))\n"
+            )),
+            Taint::Clean
+        );
+        assert_eq!(
+            sink_taint("import django\ndef v(request, pk):\n    sink(reverse('x', args=[pk]))\n"),
+            Taint::Clean
+        );
     }
 
     #[test]
