@@ -182,14 +182,17 @@ repos:
 ### How it compares
 
 The Python repository's `benchmark/` directory holds a labelled, reproducible
-comparison against Bandit and Semgrep on three intentionally vulnerable apps
-(pygoat, vulpy, dvpwa), with every finding of all three tools adjudicated by
-hand. At 1.6.0 fenceline sat between the two (76% precision, 53% recall
-against Bandit's 90% / 82%); the gap was three checks, and closing them put
-the current main at 92% precision and 94% recall, against Bandit's 90% / 77%
-and Semgrep's 99% / 32% on the same ground truth, and 97% precision at
-`--confidence-min high`. This port produces the identical 219 findings there,
-so its numbers are the same; run it against the binary with
+comparison against Bandit and Semgrep on four intentionally vulnerable apps
+(pygoat, vulpy, dvpwa, django.nV), with every finding of all three tools
+adjudicated by hand. At 1.6.0 fenceline sat between the two (76% precision,
+53% recall against Bandit's 90% / 82% on the first three apps); the gap was
+three checks, and closing them put 1.8.0 at 92% precision and 94% recall
+there. On all four apps the current main is at 86% precision and 93% recall,
+against Bandit's 89% / 76% and Semgrep's 99% / 33% on the same ground truth,
+and 97% precision at `--confidence-min high`; the drop is sixteen
+check-shaped false positives on django.nV, listed in the benchmark README.
+This port produces the identical 239 findings there, so its numbers are the
+same; run it against the binary with
 `FENCELINE_CMD=target/release/fenceline ../fenceline/benchmark/run.sh`. The
 numbers, the labelling rules and `run.sh` are in the Python repository's
 [`benchmark/README.md`](https://github.com/lvalverdeb/fenceline/blob/main/benchmark/README.md).
@@ -204,9 +207,11 @@ from a full replacement, in the order we intend to close it:
   far better than noise. A library corpus (aiohttp, botocore, tornado,
   PyYAML) is scanned for regressions and audited by hand, but it has no
   ground truth.
-- Three apps is a small benchmark, and the cross-file analysis has had only
-  a handful of findings to prove itself on. A Django or FastAPI project with
-  a service layer is the next addition.
+- Four small apps is still a small benchmark. The Django one was added so
+  the cross-file analysis had a view-to-helper chain to follow, and it does,
+  but intentionally vulnerable Python apps with a real service layer are
+  rare: the obvious candidate dispatches its vulnerable functions through
+  `importlib`, which no static analysis can see.
 - Calls are resolved by name (`import`, `from .mod import f`,
   `Class.method`, `self.method`). A method on an object whose type fenceline
   cannot see ends the trace at MEDIUM. There is no type inference.
