@@ -173,7 +173,7 @@ with cargo and scans the working tree whenever a Python file is staged:
 ```yaml
 repos:
   - repo: https://github.com/lvalverdeb/fenceline-rs
-    rev: v1.9.0
+    rev: v1.10.0
     hooks:
       - id: fenceline
         # args: [--fail-on, critical, --baseline, fenceline-baseline.json]
@@ -190,7 +190,7 @@ three checks, and closing them put 1.8.0 at 92% precision and 94% recall
 there. On all four apps 1.9.0 is at 92% precision and 93% recall,
 against Bandit's 89% / 76% and Semgrep's 99% / 33% on the same ground truth,
 and 97% precision at `--confidence-min high`. This port produces the
-identical findings there (223 at 1.9.0, 215 on main), so its numbers are
+identical findings there (215 at 1.10.0), so its numbers are
 the same; run it against
 the binary with
 `FENCELINE_CMD=target/release/fenceline ../fenceline/benchmark/run.sh`. The
@@ -204,7 +204,7 @@ planted anything and most alerts are wrong by base rate. Every finding of
 all three tools was adjudicated there too. At 1.9.0 fenceline was 3%
 precise on that corpus (22 true findings in 637), Bandit is 5%, and
 Semgrep's community rules report 17 findings with nothing true among them.
-The check-shape work since (on main, unreleased) brings fenceline to 20%
+The check-shape work in 1.10.0 brings fenceline to 20%
 (23 true in 116) and to 42% at `--confidence-min high`, where it reports
 one finding per 3,000 lines and seven in ten are real or deliberate; the
 vulnerable-app numbers moved to 96% precision and 98% at HIGH with no
@@ -216,8 +216,8 @@ positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- Precision on ordinary code is 20% (42% at `--confidence-min high`) on
-  main, and what remains is no longer check-shaped: request fields reaching
+- Precision on ordinary code is 20% (42% at `--confidence-min high`) at
+  1.10.0, and what remains is no longer check-shaped: request fields reaching
   a logger through a service layer, redirects to model URL properties,
   administrator-configured outbound URLs. The vulnerable apps test recall;
   the clean corpus shows what a team turning fenceline on sees first. Until
