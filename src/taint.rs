@@ -602,11 +602,24 @@ fn is_view_capture(dotted: &str) -> bool {
         || dotted.starts_with("self.args.")
 }
 
+/// `Model.objects.get(pk=x)` and the rest of a Django manager chain: the
+/// arguments pick a row, the result is stored data, not the request's --
+/// mirrors `taint._is_orm_lookup`.
+fn is_orm_lookup(dotted: &str) -> bool {
+    dotted.contains(".objects.")
+}
+
+/// Does the function receive a request directly: a route-decorated function,
+/// an HTTP-method handler on a view class, an AWS Lambda entry point, or, in
+/// a module that imports a web framework (`web`), a function whose first
+/// parameter is `request` (a Django, Pyramid or aiohttp function view, whose
+/// other parameters are URL captures)? Mirrors `taint._is_handler`.
 fn is_handler(
     name: &str,
     args: &Arguments,
     decorators: &[Expr],
     enclosing_class_bases: Option<&[String]>,
+    web: bool,
 ) -> bool {
     for deco in decorators {
         let target = match deco {
@@ -622,14 +635,19 @@ fn is_handler(
     if HANDLER_METHODS.contains(&name) && is_view_class(enclosing_class_bases) {
         return true;
     }
-    // An AWS Lambda entry point: the event is the request.
-    let positional: Vec<&str> = args
+    let mut positional: &[&str] = &args
         .posonlyargs
         .iter()
         .chain(args.args.iter())
         .map(|a| a.def.arg.as_str())
-        .collect();
-    positional == ["event", "context"]
+        .collect::<Vec<_>>();
+    if positional == ["event", "context"] {
+        return true; // an AWS Lambda entry point
+    }
+    if matches!(positional.first(), Some(&"self" | &"cls")) {
+        positional = &positional[1..];
+    }
+    web && positional.first() == Some(&"request")
 }
 
 fn param_names(args: &Arguments) -> HashSet<String> {
@@ -1013,7 +1031,7 @@ impl ScopeIndexer {
     ) -> Rc<ScopeInfo> {
         let cls = self.enclosing_class();
         let bases = cls.map(|(_, bases, _)| bases);
-        let handler = is_handler(name, args, decorators, bases);
+        let handler = is_handler(name, args, decorators, bases, self.module.web);
         let own = collect_own(body);
         let mut assigns: HashMap<String, Vec<Expr>> = self
             .module
@@ -1404,6 +1422,9 @@ impl<'s> Classifier<'s> {
                 if CLEAN_CALLS.contains(&dotted.as_str()) || CLEAN_METHODS.contains(&method) {
                     return Taint::Clean;
                 }
+                if is_orm_lookup(&dotted) {
+                    return Taint::Internal;
+                }
                 self.expr(&c.func, depth + 1)
                     .max(self.many(c.args.iter(), depth + 1))
                     .max(self.many(c.keywords.iter().map(|kw| &kw.value), depth + 1))
@@ -1530,6 +1551,41 @@ mod tests {
             Taint::Source
         );
         assert_eq!(sink_taint("def helper(q):\n    sink(q)\n"), Taint::Internal);
+    }
+
+    #[test]
+    fn django_function_views_are_handlers() {
+        let view = "def view(request, project_id):\n    sink(project_id)\n";
+        assert_eq!(sink_taint(view), Taint::Internal);
+        assert_eq!(sink_taint(&format!("import django\n{view}")), Taint::Source);
+        assert_eq!(
+            sink_taint(&format!("from pyramid.view import view_config\n{view}")),
+            Taint::Source
+        );
+        // `request` has to be the first parameter after `self`/`cls`.
+        assert_eq!(
+            sink_taint("import django\ndef f(project_id, request):\n    sink(project_id)\n"),
+            Taint::Internal
+        );
+        assert_eq!(
+            sink_taint(
+                "import django\nclass V:\n    def run(self, request, pk):\n        sink(pk)\n"
+            ),
+            Taint::Source
+        );
+        // A Django ORM lookup returns stored data, whatever selected the row.
+        assert_eq!(
+            sink_taint(
+                "import django\ndef view(request, pk):\n    obj = File.objects.get(pk=pk)\n    sink(obj.path)\n"
+            ),
+            Taint::Internal
+        );
+        assert_eq!(
+            sink_taint(
+                "import django\ndef view(request, pk):\n    sink(File.objects.filter(pk=pk).first())\n"
+            ),
+            Taint::Internal
+        );
     }
 
     #[test]

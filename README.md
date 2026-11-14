@@ -241,7 +241,7 @@ what they find:
 
 | The sink is fed by | Confidence |
 | --- | --- |
-| A recognised entry point: the `request` of a handler or of a module that imports a web framework, `os.environ`, `sys.argv`, `input()`, a socket read, or a parameter of a route-decorated function or handler method | `HIGH` |
+| A recognised entry point: the `request` of a handler or of a module that imports a web framework, `os.environ`, `sys.argv`, `input()`, a socket read, or a parameter of a route-decorated function, a handler method, or a function in such a module whose first parameter is `request` (a Django, Pyramid or aiohttp function view; its other parameters are URL captures) | `HIGH` |
 | A parameter that some caller elsewhere in the package feeds request data | `HIGH`, with a note on the finding |
 | Plain function parameters, `self` fields no method of the class assigns from a source, or values the function cannot resolve | `MEDIUM`, with a note on the finding |
 | Only literals, module constants, library references, or values that cannot carry a payload (a length, an `int()`, a `shlex.quote()`) | not reported |
