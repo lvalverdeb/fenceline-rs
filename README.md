@@ -190,7 +190,8 @@ three checks, and closing them put 1.8.0 at 92% precision and 94% recall
 there. On all four apps 1.9.0 is at 92% precision and 93% recall,
 against Bandit's 89% / 76% and Semgrep's 99% / 33% on the same ground truth,
 and 97% precision at `--confidence-min high`. This port produces the
-identical 223 findings there, so its numbers are the same; run it against
+identical findings there (223 at 1.9.0, 215 on main), so its numbers are
+the same; run it against
 the binary with
 `FENCELINE_CMD=target/release/fenceline ../fenceline/benchmark/run.sh`. The
 numbers, the labelling rules and `run.sh` are in the Python repository's
@@ -200,24 +201,28 @@ The same directory's `clean/` corpus measures the other side: precision on
 four ordinary, maintained applications (healthchecks, Netflix's dispatch,
 flaskbb, and the auth and HTTP packages of Home Assistant), where nobody
 planted anything and most alerts are wrong by base rate. Every finding of
-all three tools was adjudicated there too. At 1.9.0 fenceline is 3% precise
-on that corpus (22 true findings in 637), Bandit is 5%, and Semgrep's
-community rules report 17 findings with nothing true among them. Two
-fenceline checks account for four fifths of the noise: log injection on any
-f-string passed to a logger, and open redirect on Django's `redirect()`
-called with a URL pattern name. That is the number a team actually feels,
-and raising it is the current work (`ROADMAP.md`).
+all three tools was adjudicated there too. At 1.9.0 fenceline was 3%
+precise on that corpus (22 true findings in 637), Bandit is 5%, and
+Semgrep's community rules report 17 findings with nothing true among them.
+The check-shape work since (on main, unreleased) brings fenceline to 20%
+(23 true in 116) and to 42% at `--confidence-min high`, where it reports
+one finding per 3,000 lines and seven in ten are real or deliberate; the
+vulnerable-app numbers moved to 96% precision and 98% at HIGH with no
+recall change. That is the number a team actually feels, and raising it
+further is the current work (`ROADMAP.md`).
 
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- Precision on ordinary code is 3%, and `--confidence-min high` does not
-  help, because the two noisy checks report at HIGH. The vulnerable apps
-  test recall; the clean corpus shows what a team turning fenceline on sees
-  first. Until that corpus reads above the bar set in `ROADMAP.md`, adopt
-  fenceline on an existing codebase with a baseline file.
+- Precision on ordinary code is 20% (42% at `--confidence-min high`) on
+  main, and what remains is no longer check-shaped: request fields reaching
+  a logger through a service layer, redirects to model URL properties,
+  administrator-configured outbound URLs. The vulnerable apps test recall;
+  the clean corpus shows what a team turning fenceline on sees first. Until
+  that corpus reads above the bar set in `ROADMAP.md`, adopt fenceline on
+  an existing codebase with a baseline file.
 - Four small apps is still a small benchmark. The Django one was added so
   the cross-file analysis had a view-to-helper chain to follow, and it does,
   but intentionally vulnerable Python apps with a real service layer are
