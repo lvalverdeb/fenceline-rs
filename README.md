@@ -208,8 +208,13 @@ The check-shape work in 1.10.0 brings fenceline to 20%
 (23 true in 116) and to 42% at `--confidence-min high`, where it reports
 one finding per 3,000 lines and seven in ten are real or deliberate; the
 vulnerable-app numbers moved to 96% precision and 98% at HIGH with no
-recall change. That is the number a team actually feels, and raising it
-further is the current work (`ROADMAP.md`).
+recall change. A fifth application scanned blind after that tuning
+(pretalx, Django, 64,000 lines) reads 0% precise at 224 findings: three
+shapes the tuning set did not contain, chiefly URL properties built by
+urlman and Django's `get_success_url()` idiom reported as open redirects.
+The held-out number is the one a team should expect today; closing those
+shapes and re-measuring on a further application is the current work
+(`ROADMAP.md`).
 
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
@@ -217,9 +222,10 @@ community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
 - Precision on ordinary code is 20% (42% at `--confidence-min high`) at
-  1.10.0, and what remains is no longer check-shaped: request fields reaching
-  a logger through a service layer, redirects to model URL properties,
-  administrator-configured outbound URLs. The vulnerable apps test recall;
+  1.10.0 on the apps the checks were tuned on, and 0% on the one scanned
+  blind afterwards. The tuning set's residue is type-shaped (request fields
+  reaching a logger through a service layer, administrator-configured
+  outbound URLs); the held-out app's is check-shaped and next in line. The vulnerable apps test recall;
   the clean corpus shows what a team turning fenceline on sees first. Until
   that corpus reads above the bar set in `ROADMAP.md`, adopt fenceline on
   an existing codebase with a baseline file.
