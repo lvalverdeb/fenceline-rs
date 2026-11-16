@@ -586,3 +586,110 @@ pub fn sql_shape(arg: &Expr) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// The leftmost operand of a concatenation -- `a + "?x"` and `f"{a}#x"`
+/// both give `a` -- or `expr` itself. Mirrors `ast_checks._leading_operand`.
+pub fn leading_operand(expr: &Expr) -> &Expr {
+    let mut expr = expr;
+    loop {
+        match expr {
+            Expr::BinOp(b) if matches!(b.op, Operator::Add) => expr = &b.left,
+            Expr::JoinedStr(j) if matches!(j.values.first(), Some(Expr::FormattedValue(_))) => {
+                let Some(Expr::FormattedValue(f)) = j.values.first() else {
+                    unreachable!()
+                };
+                expr = &f.value;
+            }
+            _ => return expr,
+        }
+    }
+}
+
+/// Attribute names of a chain, root first, and whether the root is a bare
+/// name -- mirrors `ast_checks._attr_segments`.
+pub fn attr_segments(expr: &Expr) -> (Vec<&str>, bool) {
+    let mut parts = Vec::new();
+    let mut cur = expr;
+    while let Expr::Attribute(a) = cur {
+        parts.push(a.attr.as_str());
+        cur = &a.value;
+    }
+    let root_is_name = matches!(cur, Expr::Name(_));
+    if let Expr::Name(n) = cur {
+        parts.push(n.id.as_str());
+    }
+    parts.reverse();
+    (parts, root_is_name)
+}
+
+/// The request's own path (`request.path`, `request.get_full_path()`),
+/// possibly with a query string appended -- mirrors
+/// `ast_checks._is_request_own_path`.
+pub fn is_request_own_path(target: &Expr) -> bool {
+    const OWN_PATH: &[&str] = &[
+        "path",
+        "path_info",
+        "full_path",
+        "get_full_path",
+        "script_root",
+        "url_rule",
+    ];
+    let mut target = leading_operand(target);
+    if let Expr::Call(c) = target
+        && c.args.is_empty()
+    {
+        target = &c.func;
+    }
+    let dotted = full_attr(target);
+    let mut parts = dotted.rsplit('.');
+    let last = parts.next().unwrap_or("");
+    parts.next() == Some("request") && OWN_PATH.contains(&last)
+}
+
+/// How a redirect destination is read off one of the application's objects
+/// -- mirrors `ast_checks._url_property_kind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlProperty {
+    /// A named URL in an urlman-style namespace (`event.urls.base`).
+    Namespace,
+    /// A URL property or getter (`topic.url`, `self.get_success_url()`).
+    Property,
+}
+
+fn is_url_property_name(s: &str) -> bool {
+    let stem = s.strip_suffix("urls").or_else(|| s.strip_suffix("url"));
+    stem.is_some_and(|stem| stem.is_empty() || stem.ends_with('_'))
+}
+
+fn is_urls_namespace_name(s: &str) -> bool {
+    s.strip_suffix("urls")
+        .is_some_and(|stem| stem.is_empty() || stem.ends_with('_'))
+}
+
+pub fn url_property_kind(target: &Expr) -> Option<UrlProperty> {
+    let mut target = leading_operand(target);
+    if let Expr::Call(c) = target {
+        let constant = |e: &Expr| matches!(e, Expr::Constant(_));
+        if !c.args.iter().all(constant) || !c.keywords.iter().all(|k| constant(&k.value)) {
+            return None;
+        }
+        let Expr::Attribute(func) = c.func.as_ref() else {
+            return None;
+        };
+        if is_url_property_name(func.attr.as_str()) {
+            return Some(UrlProperty::Property);
+        }
+        target = &func.value;
+    }
+    let (parts, root_is_name) = attr_segments(target);
+    if parts.len() >= 2 && is_urls_namespace_name(parts[parts.len() - 2]) {
+        return Some(UrlProperty::Namespace);
+    }
+    if let Some(last) = parts.last()
+        && (parts.len() >= 2 || !root_is_name)
+        && is_url_property_name(last)
+    {
+        return Some(UrlProperty::Property);
+    }
+    None
+}

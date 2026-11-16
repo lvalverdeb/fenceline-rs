@@ -62,6 +62,134 @@ pub const CALLER_NOTE: &str =
 /// like any other name. `environ` is unconditional: WSGI or
 /// `from os import environ`.
 const REQUEST_ROOTS: &[&str] = &["request", "environ"];
+
+/// Attributes of a request object that carry what the client sent, across
+/// the recognised frameworks. A chain of two or more attributes under
+/// `request` whose first attribute is *not* one of these is server-side
+/// state (`request.user.email`, `request.session.get(...)`,
+/// `request.event.urls.base`) and resolves as `Internal` -- mirrors
+/// `taint._REQUEST_DATA_ATTRS`.
+const REQUEST_DATA_ATTRS: &[&str] = &[
+    // Django / DRF
+    "GET",
+    "POST",
+    "FILES",
+    "COOKIES",
+    "META",
+    "headers",
+    "body",
+    "path",
+    "path_info",
+    "full_path",
+    "get_full_path",
+    "get_host",
+    "build_absolute_uri",
+    "method",
+    "content_type",
+    "content_params",
+    "encoding",
+    "scheme",
+    "resolver_match",
+    "data",
+    "query_params",
+    "stream",
+    "read",
+    "readline",
+    "readlines",
+    // Flask / Werkzeug
+    "args",
+    "form",
+    "values",
+    "json",
+    "files",
+    "cookies",
+    "environ",
+    "url",
+    "base_url",
+    "url_root",
+    "host",
+    "host_url",
+    "remote_addr",
+    "remote_user",
+    "referrer",
+    "user_agent",
+    "authorization",
+    "accept_mimetypes",
+    "accept_languages",
+    "accept_charsets",
+    "accept_encodings",
+    "view_args",
+    "script_root",
+    "get_json",
+    "get_data",
+    "input_stream",
+    "mimetype",
+    "mimetype_params",
+    "access_route",
+    "origin",
+    "query_string",
+    "url_rule",
+    "endpoint",
+    "blueprint",
+    // aiohttp
+    "match_info",
+    "query",
+    "rel_url",
+    "raw_path",
+    "forwarded",
+    "remote",
+    "content",
+    "text",
+    "post",
+    "multipart",
+    "path_qs",
+    "http_range",
+    "if_match",
+    "if_none_match",
+    "if_range",
+    "if_modified_since",
+    "if_unmodified_since",
+    "secure",
+    "host_header",
+    // Starlette / FastAPI
+    "path_params",
+    "client",
+    "url_for",
+    // Pyramid
+    "params",
+    "matchdict",
+    "json_body",
+    "subpath",
+    "traversed",
+    "virtual_root",
+    "virtual_root_path",
+    "application_url",
+    "host_port",
+    "domain",
+    "path_url",
+    // Bottle
+    "forms",
+    "urlparts",
+    "fullpath",
+    "chunked",
+    "is_xhr",
+    "is_ajax",
+    "auth",
+    // Tornado
+    "arguments",
+    "query_arguments",
+    "body_arguments",
+    "uri",
+    "remote_ip",
+    "protocol",
+    "full_url",
+    "request_time",
+    "ip",
+];
+
+/// Framework URL validators that vouch for their first argument as a
+/// same-site destination -- mirrors `taint._URL_VALIDATORS`.
+const URL_VALIDATORS: &[&str] = &["url_has_allowed_host_and_scheme", "is_safe_url"];
 /// Top-level module names whose import marks a module as web-facing.
 const WEB_FRAMEWORKS: &[&str] = &[
     "aiohttp",
@@ -647,6 +775,29 @@ fn is_class_name(seg: &str) -> bool {
         && chars.next().is_some_and(|c| c.is_ascii_lowercase())
 }
 
+/// The attribute chain of a call target with intermediate calls folded
+/// away: `Model.objects.select_related("e").get` →
+/// `Model.objects.select_related.get` -- mirrors `taint._dotted_through_calls`.
+fn dotted_through_calls(expr: &Expr) -> String {
+    let mut parts = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::Attribute(a) => {
+                parts.push(a.attr.as_str());
+                cur = &a.value;
+            }
+            Expr::Call(c) => cur = &c.func,
+            Expr::Name(n) => {
+                parts.push(n.id.as_str());
+                parts.reverse();
+                return parts.join(".");
+            }
+            _ => return String::new(),
+        }
+    }
+}
+
 fn is_orm_lookup(dotted: &str) -> bool {
     let parts: Vec<&str> = dotted.split('.').collect();
     let last = parts[parts.len() - 1];
@@ -767,6 +918,9 @@ fn anchored_match_target(call: &ExprCall) -> Option<String> {
     }
     let dotted = expr_dotted_name(&call.func);
     let args = &call.args;
+    if URL_VALIDATORS.contains(&dotted.rsplit('.').next().unwrap_or("")) && !args.is_empty() {
+        return name_of(&args[0]);
+    }
     if dotted == "re.fullmatch" && args.len() >= 2 {
         return name_of(&args[1]);
     }
@@ -919,9 +1073,10 @@ fn bound_names(stmt: &Stmt) -> HashSet<String> {
 enum Frame {
     /// A function and its qualified name (`Class.method`, `outer.inner`).
     Function(Rc<ScopeInfo>, String),
-    /// A class: its name, its bases' dotted names, and its methods' shared
-    /// `self` field map.
-    Class(String, Vec<String>, SharedFields),
+    /// A class: its name, its bases' dotted names, its methods' shared
+    /// `self` field map, and the scope of its body (a literal there is clean
+    /// and a class attribute resolves to what the body assigned it).
+    Class(String, Vec<String>, SharedFields, Rc<ScopeInfo>),
     /// A lambda, decorator, default argument or class base: no scope.
     Opaque,
 }
@@ -1066,13 +1221,14 @@ impl ScopeIndexer {
         match self.frames.last() {
             None => Some(Rc::clone(&self.module)),
             Some(Frame::Function(s, _)) => Some(Rc::clone(s)),
-            Some(Frame::Class(..)) | Some(Frame::Opaque) => None,
+            Some(Frame::Class(_, _, _, body)) => Some(Rc::clone(body)),
+            Some(Frame::Opaque) => None,
         }
     }
 
     fn enclosing_class(&self) -> Option<(&str, &[String], &SharedFields)> {
         match self.frames.last() {
-            Some(Frame::Class(name, bases, fields)) => Some((name, bases, fields)),
+            Some(Frame::Class(name, bases, fields, _)) => Some((name, bases, fields)),
             _ => None,
         }
     }
@@ -1184,13 +1340,62 @@ impl Visitor for ScopeIndexer {
         self.visit_function(name.as_str(), *args, decorator_list, body, returns);
     }
     fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
-        let bases: Vec<String> = node.bases.iter().map(expr_dotted_name).collect();
-        self.frames.push(Frame::Class(
-            node.name.to_string(),
+        let StmtClassDef {
+            name,
             bases,
+            keywords,
+            body,
+            decorator_list,
+            ..
+        } = node;
+        let base_names: Vec<String> = bases.iter().map(expr_dotted_name).collect();
+        // Decorators, bases and keywords belong to no scope.
+        self.frames.push(Frame::Opaque);
+        for deco in decorator_list {
+            self.visit_expr(deco);
+        }
+        for base in bases {
+            self.visit_expr(base);
+        }
+        for kw in keywords {
+            self.visit_keyword(kw);
+        }
+        self.frames.pop();
+        // The body is a scope of its own, built like a parameterless
+        // function's -- mirrors the class branch of `taint._scope_map`.
+        let own = collect_own(&body);
+        let mut assigns: HashMap<String, Vec<Expr>> = self
+            .module
+            .assigns
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (name, values) in own.assigns {
+            assigns.entry(name).or_default().extend(values);
+        }
+        let mut imports = self.module.imports.clone();
+        imports.extend(own.imports);
+        let body_scope = Rc::new(ScopeInfo {
+            params: HashSet::new(),
+            handler: false,
+            assigns,
+            imports,
+            web: self.module.web,
+            cls: None,
+            caller_params: RefCell::new(HashSet::new()),
+            view_class: false,
+            fields: Default::default(),
+        });
+        self.frames.push(Frame::Class(
+            name.to_string(),
+            base_names,
             Default::default(),
+            body_scope,
         ));
-        self.generic_visit_stmt_class_def(node);
+        // A class body starts without its enclosing block's guards.
+        let outer_guards = std::mem::take(&mut self.guarded);
+        self.walk_block(body);
+        self.guarded = outer_guards;
         self.frames.pop();
     }
     fn visit_expr_lambda(&mut self, node: ExprLambda) {
@@ -1286,9 +1491,10 @@ impl TaintIndex {
     }
 
     /// Worst taint over `exprs`, resolved in the scope of the sink node
-    /// starting at `anchor`. A node the index does not know (or one in a
-    /// class body, lambda, decorator or default) is `Internal`. An empty
-    /// `exprs` is `Clean`: a sink fed nothing has nothing to inject.
+    /// starting at `anchor`: a function, a class body or the module. A node
+    /// the index does not know (a lambda, decorator or default) is
+    /// `Internal`. An empty `exprs` is `Clean`: a sink fed nothing has
+    /// nothing to inject.
     pub fn classify<'e>(
         &self,
         anchor: TextSize,
@@ -1397,6 +1603,21 @@ impl<'s> Classifier<'s> {
         SOURCE_PREFIXES.iter().any(|p| dotted.starts_with(p))
     }
 
+    /// `request.<state>.<more>` (or `self.request.<state>.<more>`): two or
+    /// more attributes under a request whose first is not a data attribute
+    /// -- server-side state, not what the client sent. Mirrors
+    /// `_Classifier.request_state`.
+    fn request_state(&self, dotted: &str) -> bool {
+        let mut parts: Vec<&str> = dotted.split('.').collect();
+        if parts.len() >= 2 && parts[0] == "self" && parts[1] == "request" {
+            parts.remove(0);
+        }
+        if parts.len() < 3 || parts[0] != "request" || !self.request_root("request") {
+            return false;
+        }
+        !REQUEST_DATA_ATTRS.contains(&parts[1])
+    }
+
     fn name(&mut self, name: &str, depth: u32) -> Taint {
         if REQUEST_ROOTS.contains(&name) && self.request_root(name) {
             return Taint::Source;
@@ -1452,6 +1673,9 @@ impl<'s> Classifier<'s> {
                     return Taint::Clean;
                 }
                 let dotted = expr_dotted_name(node);
+                if !dotted.is_empty() && self.request_state(&dotted) {
+                    return Taint::Internal;
+                }
                 if !dotted.is_empty() && self.source_chain(&dotted) {
                     return Taint::Source;
                 }
@@ -1465,6 +1689,9 @@ impl<'s> Classifier<'s> {
             }
             Expr::Subscript(s) => {
                 let dotted = expr_dotted_name(&s.value);
+                if !dotted.is_empty() && self.request_state(&dotted) {
+                    return Taint::Internal;
+                }
                 if !dotted.is_empty() && self.source_chain(&dotted) {
                     return Taint::Source;
                 }
@@ -1480,6 +1707,11 @@ impl<'s> Classifier<'s> {
                     Expr::Attribute(a) => a.attr.as_str(),
                     _ => "",
                 };
+                if self.request_state(&dotted) {
+                    return Taint::Internal
+                        .max(self.many(c.args.iter(), depth + 1))
+                        .max(self.many(c.keywords.iter().map(|kw| &kw.value), depth + 1));
+                }
                 if SOURCE_CALLS.contains(&dotted.as_str())
                     || self.source_chain(&dotted)
                     || SOURCE_METHODS.contains(&method)
@@ -1489,7 +1721,7 @@ impl<'s> Classifier<'s> {
                 if CLEAN_CALLS.contains(&dotted.as_str()) || CLEAN_METHODS.contains(&method) {
                     return Taint::Clean;
                 }
-                if is_orm_lookup(&dotted) {
+                if is_orm_lookup(&dotted_through_calls(&c.func)) {
                     return Taint::Internal;
                 }
                 self.expr(&c.func, depth + 1)
@@ -1766,8 +1998,68 @@ mod tests {
             .map(|c| c.data_taint)
             .collect();
         assert_eq!(taints, vec![Taint::Clean, Taint::Internal]);
-        // A call in a class body, a lambda or a decorator has no scope.
-        assert_eq!(sink_taint("class C:\n    x = sink('a')\n"), Taint::Internal);
+        // A class body is a scope: literals are clean and class attributes
+        // resolve to what the body assigned them. A lambda has no scope.
+        assert_eq!(sink_taint("class C:\n    x = sink('a')\n"), Taint::Clean);
+        assert_eq!(
+            sink_taint("class C:\n    t = 'a'\n    x = sink(t)\n"),
+            Taint::Clean
+        );
+        assert_eq!(
+            sink_taint("class C:\n    x = sink(unknown)\n"),
+            Taint::Internal
+        );
         assert_eq!(sink_taint("f = lambda: sink('a')\n"), Taint::Internal);
+    }
+
+    #[test]
+    fn request_state_chains_and_url_validator() {
+        let django = "from django.shortcuts import redirect\n";
+        let t = |body: &str| sink_taint(&format!("{django}{body}"));
+        // Two or more attributes under request whose first is not a data
+        // attribute are server-side state; a data attribute or a single
+        // unknown one stays a source.
+        assert_eq!(
+            t("def v(request):\n    sink(request.event.urls.base)\n"),
+            Taint::Internal
+        );
+        assert_eq!(
+            t("def v(request):\n    sink(request.session.get('n'))\n"),
+            Taint::Internal
+        );
+        assert_eq!(
+            t("def v(request):\n    sink(request.GET.get('n'))\n"),
+            Taint::Source
+        );
+        assert_eq!(
+            t("def v(request):\n    sink(request.body)\n"),
+            Taint::Source
+        );
+        assert_eq!(
+            t("def v(request):\n    sink(request.thing)\n"),
+            Taint::Source
+        );
+        assert_eq!(
+            t("def v(request):\n    sink(request.user.has_perm(request.GET['p']))\n"),
+            Taint::Source
+        );
+        assert_eq!(
+            t("class V:\n    def get(self):\n        sink(self.request.user.email)\n"),
+            Taint::Internal
+        );
+        // An ORM chain with an intermediate call is still a lookup.
+        assert_eq!(
+            t(
+                "def v(request):\n    sink(Submission.objects.select_related('e').get(code=request.GET['c']))\n"
+            ),
+            Taint::Internal
+        );
+        // Django's URL validator is a guard on its first argument.
+        assert_eq!(
+            t(
+                "def v(request):\n    u = request.GET['n']\n    if not url_has_allowed_host_and_scheme(u, allowed_hosts=None):\n        return\n    sink(u)\n"
+            ),
+            Taint::Clean
+        );
     }
 }

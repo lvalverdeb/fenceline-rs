@@ -5,6 +5,7 @@
 //! itself.
 
 use crate::analysis::ParsedFile;
+use crate::ast_helpers::UrlProperty;
 use crate::ast_helpers::{
     LOGGING_METHOD_NAMES, call_name, dotted_matches, full_attr, resolve_dotted, skip,
 };
@@ -1141,28 +1142,6 @@ fn is_same_site_path(lead: &str) -> bool {
 /// path or, in Django, a URL pattern name with URL parameters) and one whose
 /// destination starts with a literal path (`"/tasks/" + task_id`) are not
 /// open redirects.
-/// The request's own path (`redirect(request.path)`,
-/// `redirect(request.get_full_path())`): a redirect back to it stays on
-/// the site -- mirrors `ast_checks._is_request_own_path`.
-fn is_request_own_path(c: &crate::analysis::CallRec) -> bool {
-    const OWN_PATH: &[&str] = &[
-        "path",
-        "path_info",
-        "full_path",
-        "get_full_path",
-        "script_root",
-        "url_rule",
-    ];
-    let dotted = c
-        .first_arg_dotted
-        .as_deref()
-        .or(c.first_arg_call_full_attr.as_deref())
-        .unwrap_or("");
-    let mut parts = dotted.rsplit('.');
-    let last = parts.next().unwrap_or("");
-    parts.next() == Some("request") && OWN_PATH.contains(&last)
-}
-
 pub fn check_open_redirect(
     _path: &Path,
     pk: &str,
@@ -1177,7 +1156,13 @@ pub fn check_open_redirect(
         .filter(|c| REDIRECT_CALLS.contains(&c.call_name.as_str()))
         .filter(|c| c.first_arg_str.is_none())
         .filter(|c| !c.data_leading_str.as_deref().is_some_and(is_same_site_path))
-        .filter(|c| !is_request_own_path(c))
+        .filter(|c| !c.first_arg_own_path)
+        .filter(|c| {
+            !matches!(
+                (c.sole_arg_url_property, c.data_taint),
+                (Some(UrlProperty::Namespace), _) | (Some(UrlProperty::Property), Taint::Internal)
+            )
+        })
         .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(

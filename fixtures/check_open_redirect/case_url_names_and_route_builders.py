@@ -12,5 +12,5 @@ def django_views(request, code):
 def flask_views(topic_id):
     topic = Topic.query.filter_by(id=topic_id).first_or_404()
     redirect(url_for("forum.topic", topic_id=request.args["t"]))
-    redirect(topic.url)
+    redirect(topic.url)  # a model's URL property: the application built it
     return redirect(request.args["next"])

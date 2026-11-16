@@ -191,6 +191,12 @@ pub struct CallRec {
     pub keyword_names: Vec<String>,
     pub keyword_true_names: Vec<String>,
     pub first_arg_call_full_attr: Option<String>,
+    /// The first positional argument is the request's own path, possibly
+    /// with a query string appended -- see `ast_helpers::is_request_own_path`.
+    pub first_arg_own_path: bool,
+    /// The sole argument is read off an object's URL namespace or URL
+    /// property -- see `ast_helpers::url_property_kind`.
+    pub sole_arg_url_property: Option<crate::ast_helpers::UrlProperty>,
     /// Only meaningful when `full_attr == "compile"`: true if this is
     /// `re.compile(...)` or a SQLAlchemy-style `.compile()` -- both
     /// excluded from `check_eval_exec`'s bare-`compile()` rule.
@@ -589,6 +595,16 @@ impl<'a> Visitor for Collector<'a> {
                 None
             }
         });
+        let sole_arg = if node.args.len() == 1 && node.keywords.is_empty() {
+            node.args.first()
+        } else {
+            None
+        };
+        let first_arg_own_path = node
+            .args
+            .first()
+            .is_some_and(crate::ast_helpers::is_request_own_path);
+        let sole_arg_url_property = sole_arg.and_then(crate::ast_helpers::url_property_kind);
         // Needed by check_eval_exec (re.compile/sqlalchemy .compile()
         // exclusion) -- computed here since it needs the *whole* Call node,
         // not just the recorded fields.
@@ -705,6 +721,8 @@ impl<'a> Visitor for Collector<'a> {
             keyword_names,
             keyword_true_names,
             first_arg_call_full_attr,
+            first_arg_own_path,
+            sole_arg_url_property,
             is_excluded_compile,
             allow_pickle_kw_line,
             data_taint,

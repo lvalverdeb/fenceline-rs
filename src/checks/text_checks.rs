@@ -245,7 +245,14 @@ pub fn check_sensitive_exposure(
 
 // ── check_null_byte (CWE-158) ────────────────────────────────────────────
 
-static NULL_BYTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\x00|\\0").unwrap());
+/// A NUL escape: `\x00`, or octal `\0` / `\00` / `\000` not followed by
+/// another octal digit (`\033` is ESC, not NUL) -- mirrors `_NUL_ESCAPE_RE`.
+static NULL_BYTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\x00|\\00?0?(?:[^0-7]|$)").unwrap());
+/// A NUL escape as the operand of a membership test or the start of a regex
+/// character class: validation, not injection -- mirrors `_NUL_VALIDATION_RE`.
+static NUL_VALIDATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"["']\\x00["']\s+(?:not\s+)?in\b|\[\\x00-"#).unwrap());
 
 pub fn check_null_byte(
     _path: &Path,
@@ -258,7 +265,7 @@ pub fn check_null_byte(
         if skip(line) {
             continue;
         }
-        if NULL_BYTE_RE.is_match(line) {
+        if NULL_BYTE_RE.is_match(line) && !NUL_VALIDATION_RE.is_match(line) {
             results.push(finding(
                 "CWE-158", "NUL Byte Injection", Severity::Info, Confidence::default(),
                 pk, i + 1, line.trim(),
