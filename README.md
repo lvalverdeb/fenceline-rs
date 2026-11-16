@@ -78,6 +78,8 @@ Exit codes: `0` (no findings at or above `--fail-on`), `1` (one or more).
 | `--confidence-min` | `low` | Drop findings below this confidence (`high`\|`medium`\|`low`) |
 | `--baseline PATH` | — | Only report/fail on findings not already present in this baseline |
 | `--write-baseline PATH` | — | Snapshot current findings to PATH and exit 0 |
+| `--rules PATH` | — | TOML file of `[[rule]]` tables run after the built-in checks (repeatable; see the Python repository's `docs/rules.md`) |
+| `--disable CHECK` | — | Do not run this built-in check, by function name (repeatable), e.g. `--disable check_pandas_pickle` |
 | `--include-tests` | off | Include CWE-798/617/918/770/295 findings inside test code (see "Test code" below) |
 | `--test-paths DIRNAME [DIRNAME ...]` | — | Extra directory names to treat as non-production, alongside the built-in `tests`/`test`/`conftest.py` conventions (see "Test code" below) |
 | `--version` | — | Print the installed fenceline version and exit |
@@ -262,9 +264,11 @@ from a full replacement, in the order we intend to close it:
 - Calls are resolved by name (`import`, `from .mod import f`,
   `Class.method`, `self.method`). A method on an object whose type fenceline
   cannot see ends the trace at MEDIUM. There is no type inference.
-- The 58 checks are fixed. The Python original has a plugin API for your
-  own checks; this port has none (see Design), and neither has a declarative
-  rule format like Semgrep's.
+- The 58 checks are fixed. A TOML rule format (`docs/rules.md` in the
+  Python repository) adds sinks, calls, keyword tests and line patterns
+  without code, read identically by both ports; `docs/semgrep-coverage.md`
+  there says which Semgrep `p/python` rules it and the built-ins cover
+  (121 of 151). The Python original's plugin API covers the rest.
 - `check_dependency_cve` is a curated watchlist, not an advisory database;
   keep `pip-audit` for that.
 
@@ -409,7 +413,7 @@ code such as `E501` suppresses nothing.
 - `reporting` — text, JSON and SARIF report rendering. JSON field order is guaranteed by struct-field declaration order (not a `serde_json::Value::Object`, whose map-ordering would need an explicit feature flag to avoid alphabetical sorting).
 - `cli` — argument parsing and the scan loop: every file of a package is parsed first, the callers pass runs, then the checks.
 
-**Not ported, and not planned**: the Python original's third-party plugin architecture (`fenceline.checks` entry-point discovery for external check functions). A Rust equivalent would need dynamic loading of compiled code (`dlopen`-style), which trades away the single-static-binary property that's the whole point of this port — see `RUST_PORT_PROPOSAL.md` §7.8 in the Python repo for the full reasoning.
+**Not ported, and not planned**: the Python original's third-party plugin architecture (`fenceline.checks` entry-point discovery for external check functions). A Rust equivalent would need dynamic loading of compiled code. Declarative rules (`--rules`, the Python repository's `docs/rules.md`) are the supported way to add checks to this port: both ports load the same TOML file and run the same `fixtures/rules/` conformance cases.
 
 ## Development
 
