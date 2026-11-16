@@ -232,12 +232,12 @@ findings per 1,000 lines (19% and 55% at `--confidence-min high`, 0.5 per
 log-injection findings no other tool reports; after its round (writes rated
 by destination, `is_relative_to()` as a path guard, error responses as
 handling) and with Mealie in the corpus, eight apps and 280,000 lines read
-11% strict and 33% lenient at 0.9 findings per 1,000 lines (19% and 52% at
+11% strict and 34% lenient at 0.9 findings per 1,000 lines (19% and 52% at
 `--confidence-min high`, 0.5 per 1,000). The precision work (`ROADMAP.md`,
 C2) closed there, with the corpus as the regression gate; the blind numbers,
 one to two findings per 1,000 lines, are the ones a team should expect on
 day one. On recall against bugs that shipped, a set of 28 real CVEs pinned
-at their last vulnerable commit (`benchmark/cves/`) reads 15 of the 22 in
+at their last vulnerable commit (`benchmark/cves/`) reads 17 of the 22 in
 classes fenceline claims found, 12 at HIGH, with every miss attributed to
 a cause; the six in classes it does not claim are missed by construction.
 
@@ -246,7 +246,7 @@ positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- Precision on ordinary code is 11% strict and 33% lenient (19% and 52%
+- Precision on ordinary code is 11% strict and 34% lenient (19% and 52%
   at `--confidence-min high`) on eight apps, and four blind applications
   in a row read below the bar: 1.6 findings per 1,000 lines at 13%
   lenient on the latest, where the bar is one at 35%. The vulnerable apps
