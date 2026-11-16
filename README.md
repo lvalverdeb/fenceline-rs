@@ -227,19 +227,25 @@ and 30% lenient, 1.1 findings per 1,000 lines. The third blind application
 `print()` and `abort()` as handling, and `# noqa: Sxxx` honoured) the
 corpus is seven apps and 237,000 lines at 12% strict and 38% lenient, 0.8
 findings per 1,000 lines (19% and 55% at `--confidence-min high`, 0.5 per
-1,000). The fourth blind application (Mealie, FastAPI, 43,000 lines) reads
+1,000). The fourth blind application (Mealie, FastAPI, 43,000 lines) read
 4% strict and 13% lenient at 1.6 per 1,000 lines, with three real
-log-injection findings no other tool reports. The blind numbers are the
-ones a team should expect today (`ROADMAP.md`, D10).
+log-injection findings no other tool reports; after its round (writes rated
+by destination, `is_relative_to()` as a path guard, error responses as
+handling) and with Mealie in the corpus, eight apps and 280,000 lines read
+11% strict and 33% lenient at 0.9 findings per 1,000 lines (19% and 52% at
+`--confidence-min high`, 0.5 per 1,000). The precision work (`ROADMAP.md`,
+C2) closed there, with the corpus as the regression gate; the blind numbers,
+one to two findings per 1,000 lines, are the ones a team should expect on
+day one.
 
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- Precision on ordinary code is 12% strict and 38% lenient (19% and 55%
-  at `--confidence-min high`) on seven apps, and four blind applications
-  in a row have read below the bar: 1.6 findings per 1,000 lines at 13%
+- Precision on ordinary code is 11% strict and 33% lenient (19% and 52%
+  at `--confidence-min high`) on eight apps, and four blind applications
+  in a row read below the bar: 1.6 findings per 1,000 lines at 13%
   lenient on the latest, where the bar is one at 35%. The vulnerable apps
   test recall;
   the clean corpus shows what a team turning fenceline on sees first. Until
