@@ -1,0 +1,70 @@
+{
+  "findings": [
+    {
+      "cwe_id": "CWE-1088",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 23
+    },
+    {
+      "cwe_id": "CWE-322",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "line": 32
+    },
+    {
+      "cwe_id": "CWE-502",
+      "severity": "CRITICAL",
+      "confidence": "HIGH",
+      "line": 16
+    },
+    {
+      "cwe_id": "CWE-502",
+      "severity": "CRITICAL",
+      "confidence": "HIGH",
+      "line": 19
+    },
+    {
+      "cwe_id": "CWE-502",
+      "severity": "CRITICAL",
+      "confidence": "HIGH",
+      "line": 25
+    },
+    {
+      "cwe_id": "CWE-502",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 21
+    },
+    {
+      "cwe_id": "CWE-502",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 26
+    },
+    {
+      "cwe_id": "CWE-61",
+      "severity": "MEDIUM",
+      "confidence": "MEDIUM",
+      "line": 29
+    },
+    {
+      "cwe_id": "CWE-611",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 17
+    },
+    {
+      "cwe_id": "CWE-79",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 27
+    },
+    {
+      "cwe_id": "CWE-90",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "line": 30
+    }
+  ]
+}

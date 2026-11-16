@@ -8,6 +8,7 @@
 use fenceline::analysis::ParsedFile;
 use fenceline::checks::{LineView, checks};
 use fenceline::models::{Confidence, Finding, Severity};
+use fenceline::rules::{load_rule_set, run_rules};
 use fenceline::scanner::mask_non_code;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -66,6 +67,9 @@ fn fixture_corpus_matches_expected_findings() {
             continue;
         }
         let check_name = check_dir.file_name().unwrap().to_str().unwrap().to_string();
+        if check_name == "rules" {
+            continue;
+        }
         let Some(check) = checks.get(check_name.as_str()) else {
             failures.push(format!(
                 "{check_name}: no matching Rust check function registered"
@@ -148,6 +152,86 @@ fn fixture_corpus_matches_expected_findings() {
         "{}/{} fixture cases failed:\n{}",
         failures.len(),
         case_count,
+        failures.join("\n")
+    );
+}
+
+/// `fixtures/rules/<set>/rules.toml` with that directory's `case_*.py` +
+/// `case_*.expected.json` pairs: the declarative-rule conformance cases,
+/// shared with the Python port like the check cases.
+#[test]
+fn rule_fixture_corpus_matches_expected_findings() {
+    let rules_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/rules");
+    assert!(rules_root.is_dir(), "fixtures/rules/ directory must exist");
+
+    let mut case_count = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for set_dir in std::fs::read_dir(&rules_root).unwrap() {
+        let set_dir = set_dir.unwrap().path();
+        let rules_file = set_dir.join("rules.toml");
+        if !rules_file.is_file() {
+            continue;
+        }
+        let set_name = set_dir.file_name().unwrap().to_str().unwrap().to_string();
+        let rules = load_rule_set(None, std::slice::from_ref(&rules_file))
+            .unwrap_or_else(|e| panic!("rules/{set_name}: {e}"));
+        for entry in std::fs::read_dir(&set_dir).unwrap() {
+            let py_path = entry.unwrap().path();
+            if py_path.extension().and_then(|e| e.to_str()) != Some("py") {
+                continue;
+            }
+            let stem = py_path.file_stem().unwrap().to_str().unwrap();
+            let expected_path = set_dir.join(format!("{stem}.expected.json"));
+            if !expected_path.exists() {
+                continue;
+            }
+            case_count += 1;
+            let source = std::fs::read_to_string(&py_path).unwrap();
+            let expected: ExpectedCase =
+                serde_json::from_str(&std::fs::read_to_string(&expected_path).unwrap()).unwrap();
+            let path_name = expected
+                .path_name
+                .clone()
+                .unwrap_or_else(|| py_path.file_name().unwrap().to_str().unwrap().to_string());
+            let fake_path_buf = py_path.with_file_name(&path_name);
+            let fake_path = fake_path_buf.as_path();
+            let lines: Vec<String> = source.lines().map(str::to_string).collect();
+            let tree = if fake_path.extension().and_then(|e| e.to_str()) == Some("py") {
+                ParsedFile::parse(&source, fake_path)
+            } else {
+                None
+            };
+            let code_lines = mask_non_code(fake_path, &source, tree.as_ref().map(|t| &t.module));
+            let findings = run_rules(&rules, &path_name, &lines, &code_lines, tree.as_ref());
+            let mut actual: Vec<_> = findings.iter().map(fingerprint).collect();
+            actual.sort();
+            let mut expected_fps: Vec<_> = expected
+                .findings
+                .iter()
+                .map(|f| {
+                    (
+                        f.cwe_id.clone(),
+                        severity_from_str(&f.severity),
+                        confidence_from_str(&f.confidence),
+                        f.line,
+                    )
+                })
+                .collect();
+            expected_fps.sort();
+            if actual != expected_fps {
+                failures.push(format!(
+                    "rules/{set_name}/{stem}: expected {expected_fps:?}, got {actual:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        case_count > 0,
+        "expected to discover at least one rule fixture case"
+    );
+    assert!(
+        failures.is_empty(),
+        "rule fixture mismatches:\n{}",
         failures.join("\n")
     );
 }

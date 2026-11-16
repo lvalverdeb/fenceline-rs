@@ -1,0 +1,74 @@
+# One rule per kind, plus the three keyword tests. Run by both ports'
+# conformance suites against case_*.py here; see docs/rules.md.
+
+[[rule]]
+id = "kinds/mako-sink"
+cwe = "CWE-94"
+name = "Mako template from data"
+severity = "HIGH"
+description = "A Mako Template built from a non-literal string renders attacker-controlled code."
+kind = "sink"
+callee = ["mako.template.Template"]
+data = "first"
+
+[[rule]]
+id = "kinds/render-selected"
+cwe = "CWE-79"
+name = "Rendered text from data"
+severity = "MEDIUM"
+description = "render() interpolates its second argument or text= without escaping."
+kind = "sink"
+callee = ["render"]
+data = [1, "text"]
+
+[[rule]]
+id = "kinds/mktemp-call"
+cwe = "CWE-377"
+name = "Insecure Temporary File"
+severity = "HIGH"
+description = "tempfile.mktemp() names a file without creating it (TOCTOU race)."
+kind = "call"
+callee = ["tempfile.mktemp"]
+
+[[rule]]
+id = "kinds/verify-false"
+cwe = "CWE-295"
+name = "Improper Certificate Validation"
+severity = "CRITICAL"
+description = "verify=False disables TLS certificate validation."
+kind = "keyword"
+callee = ["requests.get", "requests.post", "httpx.get"]
+keyword = "verify"
+value = false
+
+[[rule]]
+id = "kinds/no-timeout"
+cwe = "CWE-1088"
+name = "Synchronous Access without Timeout"
+severity = "HIGH"
+description = "requests.get() without timeout= may hang indefinitely."
+kind = "keyword"
+callee = ["requests.get"]
+keyword = "timeout"
+required = true
+confidence = "MEDIUM"
+
+[[rule]]
+id = "kinds/torch-weights-only"
+cwe = "CWE-502"
+name = "Deserialization of Untrusted Data (torch.load)"
+severity = "CRITICAL"
+description = "torch.load() without weights_only=True unpickles arbitrary objects."
+kind = "keyword"
+callee = ["torch.load"]
+keyword = "weights_only"
+unless = true
+
+[[rule]]
+id = "kinds/symlink-pattern"
+cwe = "CWE-61"
+name = "UNIX Symbolic Link Following"
+severity = "MEDIUM"
+description = "Creating a symlink: verify the target is validated."
+kind = "pattern"
+regex = "\\.symlink_to\\(|os\\.symlink\\("

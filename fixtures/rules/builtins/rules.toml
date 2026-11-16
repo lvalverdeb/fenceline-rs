@@ -1,0 +1,148 @@
+# Ten built-in checks re-expressed as rules: the C4 proof (ROADMAP.md).
+# Run with the built-ins disabled, these produce the same findings on the
+# three corpora:
+#
+#   fenceline --rules fixtures/rules/builtins/rules.toml \
+#     --disable check_pandas_pickle --disable check_pandas_xml_xxe \
+#     --disable check_torch_load --disable check_numpy_load \
+#     --disable check_request_timeout --disable check_pickle \
+#     --disable check_unsafe_markup --disable check_symlink \
+#     --disable check_ldap --disable check_ssh_host_key ...
+#
+# benchmark/README.md records the measurement; docs/rules.md the format.
+
+# check_pandas_pickle
+[[rule]]
+id = "builtins/pandas-read-pickle"
+cwe = "CWE-502"
+name = "Deserialization of Untrusted Data (read_pickle)"
+severity = "CRITICAL"
+description = "pd.read_pickle() deserializes Python objects via pickle — arbitrary code execution if the file is untrusted."
+kind = "call"
+callee = ["pandas.read_pickle", "pd.read_pickle"]
+
+# check_pandas_xml_xxe
+[[rule]]
+id = "builtins/pandas-read-xml"
+cwe = "CWE-611"
+name = "XXE via pandas.read_xml"
+severity = "HIGH"
+description = "pd.read_xml() defaults to the lxml parser — may be vulnerable to XXE. Use parser='etree' or defuse lxml."
+kind = "keyword"
+callee = ["pandas.read_xml", "pd.read_xml"]
+keyword = "parser"
+required = true
+
+# check_torch_load
+[[rule]]
+id = "builtins/torch-load"
+cwe = "CWE-502"
+name = "Deserialization of Untrusted Data (torch.load)"
+severity = "CRITICAL"
+description = "torch.load() without weights_only=True — enables arbitrary code execution via pickle."
+kind = "keyword"
+callee = ["torch.load"]
+keyword = "weights_only"
+unless = true
+
+# check_numpy_load
+[[rule]]
+id = "builtins/numpy-load-allow-pickle"
+cwe = "CWE-502"
+name = "Deserialization of Untrusted Data (numpy.load)"
+severity = "HIGH"
+description = "np.load(allow_pickle=True) deserializes pickled object arrays — arbitrary code execution if the file is untrusted."
+kind = "keyword"
+callee = ["numpy.load", "np.load"]
+keyword = "allow_pickle"
+value = true
+
+# check_request_timeout
+[[rule]]
+id = "builtins/requests-timeout"
+cwe = "CWE-1088"
+name = "Synchronous Access without Timeout"
+severity = "HIGH"
+description = "requests call without timeout= — may hang indefinitely. Add timeout=."
+kind = "keyword"
+callee = ["requests.get", "requests.post", "requests.put", "requests.patch", "requests.delete", "requests.head", "requests.options", "requests.request"]
+keyword = "timeout"
+required = true
+
+# check_pickle (two severities)
+[[rule]]
+id = "builtins/pickle-critical"
+cwe = "CWE-502"
+name = "Deserialization of Untrusted Data"
+severity = "CRITICAL"
+description = "Unsafe deserialisation via pickle/cloudpickle/dill. Allows arbitrary code execution."
+kind = "call"
+callee = ["pickle.loads", "pickle.load", "pickle.Unpickler", "cloudpickle.loads", "cloudpickle.load", "dill.loads", "dill.load"]
+
+[[rule]]
+id = "builtins/pickle-high"
+cwe = "CWE-502"
+name = "Deserialization of Untrusted Data"
+severity = "HIGH"
+description = "Unsafe deserialisation via joblib/shelve/marshal. Allows arbitrary code execution."
+kind = "call"
+callee = ["joblib.load", "shelve.open", "marshal.loads", "marshal.load"]
+
+# check_unsafe_markup
+[[rule]]
+id = "builtins/unsafe-markup"
+cwe = "CWE-79"
+name = "Cross-site Scripting"
+severity = "HIGH"
+description = "mark_safe()/Markup() disables HTML escaping — XSS if the content is user-controlled."
+kind = "sink"
+callee = ["mark_safe", "Markup"]
+data = "all"
+
+# check_symlink
+[[rule]]
+id = "builtins/symlink"
+cwe = "CWE-61"
+name = "UNIX Symbolic Link Following"
+severity = "MEDIUM"
+description = "Creating symlink — verify target is validated to prevent path escape."
+kind = "pattern"
+regex = "\\.symlink_to|os\\.symlink"
+
+# check_ldap
+[[rule]]
+id = "builtins/ldap"
+cwe = "CWE-90"
+name = "LDAP Injection"
+severity = "HIGH"
+description = "LDAP connection — verify queries are parameterised."
+kind = "pattern"
+regex = "ldap\\.initialize|ldap3"
+
+# check_ssh_host_key (three patterns, three descriptions)
+[[rule]]
+id = "builtins/ssh-auto-add-policy"
+cwe = "CWE-322"
+name = "Key Exchange without Entity Authentication"
+severity = "HIGH"
+description = "paramiko AutoAddPolicy — auto-accepts any unknown host key (MITM)."
+kind = "pattern"
+regex = "AutoAddPolicy"
+
+[[rule]]
+id = "builtins/ssh-warning-policy"
+cwe = "CWE-322"
+name = "Key Exchange without Entity Authentication"
+severity = "HIGH"
+description = "paramiko WarningPolicy — warns but allows connection with unknown host key (MITM)."
+kind = "pattern"
+regex = "WarningPolicy"
+
+[[rule]]
+id = "builtins/ssh-tunnel"
+cwe = "CWE-322"
+name = "Key Exchange without Entity Authentication"
+severity = "HIGH"
+description = "sshtunnel.open_tunnel — verify host_key is explicitly set."
+kind = "pattern"
+regex = "sshtunnel\\.open_tunnel"

@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod models;
 pub mod reporting;
+pub mod rules;
 pub mod scanner;
 pub mod suppression;
 pub mod taint;

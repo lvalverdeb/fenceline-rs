@@ -60,6 +60,15 @@ pub enum Confidence {
 }
 
 impl Confidence {
+    pub fn parse(text: &str) -> Option<Confidence> {
+        match text.to_ascii_uppercase().as_str() {
+            "HIGH" => Some(Confidence::High),
+            "MEDIUM" => Some(Confidence::Medium),
+            "LOW" => Some(Confidence::Low),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Confidence::High => "HIGH",

@@ -11,10 +11,11 @@ use crate::config::{
 };
 use crate::models::{Confidence, Finding, Severity};
 use crate::reporting::{print_report, print_sarif};
+use crate::rules::{load_rule_set, run_rules};
 use crate::scanner::{is_test_path, iter_py, mask_non_code, read_source, rel, split_lines};
 use crate::suppression::apply_suppressions;
 use clap::{Parser, ValueEnum};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Path-substring patterns skipped while walking a cwd-auto-discovered
@@ -225,6 +226,17 @@ pub struct Args {
     /// Write current findings to PATH as a baseline (for --baseline on later runs) and exit 0
     #[arg(long, value_name = "PATH")]
     pub write_baseline: Option<PathBuf>,
+
+    /// TOML file of [[rule]] tables, run after the built-in checks
+    /// (repeatable; see docs/rules.md in the Python repository). [[rule]]
+    /// tables in the --config file load too.
+    #[arg(long, value_name = "PATH")]
+    pub rules: Vec<PathBuf>,
+
+    /// Do not run this built-in check, by function name (repeatable),
+    /// e.g. --disable check_pandas_pickle
+    #[arg(long, value_name = "CHECK")]
+    pub disable: Vec<String>,
 }
 
 /// Parses repeated `--package NAME=PATH` CLI entries into a registry. Every
@@ -490,6 +502,28 @@ pub fn run(args: &Args) -> i32 {
         eprintln!("error: [tool.fenceline.severity]: unknown check '{unknown}'");
         return 2;
     }
+    let rules = match load_rule_set(args.config.as_deref(), &args.rules) {
+        Ok(rules) => rules,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return 2;
+        }
+    };
+    let mut unknown_disabled: Vec<&str> = args
+        .disable
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !all_checks.iter().any(|c| c.fn_name == *name))
+        .collect();
+    unknown_disabled.sort_unstable();
+    if !unknown_disabled.is_empty() {
+        eprintln!(
+            "error: --disable: unknown check(s) {}",
+            unknown_disabled.join(", ")
+        );
+        return 2;
+    }
+    let disabled: HashSet<&str> = args.disable.iter().map(String::as_str).collect();
 
     let mut path_package: BTreeMap<PathBuf, String> = BTreeMap::new();
     for (name, root) in &packages {
@@ -560,6 +594,9 @@ pub fn run(args: &Args) -> i32 {
 
         let mut file_findings = Vec::new();
         for check in &all_checks {
+            if disabled.contains(check.fn_name) {
+                continue;
+            }
             let view = match check.view {
                 LineView::CodeOnly => &code_lines,
                 LineView::Raw => &lines,
@@ -573,6 +610,8 @@ pub fn run(args: &Args) -> i32 {
                 file_findings.push(f);
             }
         }
+
+        file_findings.extend(run_rules(&rules, &pk, &lines, &code_lines, tree.as_ref()));
 
         let (kept, suppressed_here) = apply_suppressions(file_findings, &lines);
         nosec_suppressed += suppressed_here;
