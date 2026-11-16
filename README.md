@@ -213,25 +213,30 @@ tuned on: a fifth application scanned blind afterwards (pretalx, Django,
 64,000 lines) read 0% precise at 224 findings, almost all of them URL
 properties built by urlman and Django's `get_success_url()` idiom reported
 as open redirects. Fixing those shapes and folding pretalx into the corpus
-gives, on five apps and 193,000 lines, 12% strict and 24% lenient
-precision at one finding per 1,000 lines (23% and 42% at
-`--confidence-min high`). The next blind application (Tandoor Recipes,
-Django, 20,000 lines) reads 3% strict but 65% lenient (83% at HIGH) at
-seven findings per 1,000 lines: nearly every finding there is a deliberate
-`except Exception:` fallback, reported by two checks at once. The blind
-numbers are the ones a team should expect today; the handler shape is the
-next item (`ROADMAP.md`).
+gave, on five apps and 193,000 lines, 12% strict and 24% lenient
+precision at one finding per 1,000 lines. The next blind application
+(Tandoor Recipes, Django, 20,000 lines) read 3% strict but 65% lenient at
+seven findings per 1,000 lines: nearly every finding there was a deliberate
+`except Exception:` fallback, reported by two checks at once. After the
+handler round (a handler is reported once, and one that only substitutes
+a value is not reported as unlogged) the corpus is six apps and 213,000
+lines at 11% strict and 30% lenient, 1.1 findings per 1,000 lines (18% and
+50% at `--confidence-min high`, 0.5 per 1,000). The third blind
+application (CTFd, Flask, 24,000 lines) reads 0% strict and 15% lenient at
+1.4 per 1,000 lines: no tool found a vulnerability in it, and the 28 false
+findings are listed by shape in `benchmark/README.md`. The blind numbers
+are the ones a team should expect today (`ROADMAP.md`, D9).
 
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- Precision on ordinary code is 12% strict and 24% lenient (23% and 42%
-  at `--confidence-min high`) on five apps, and the second blind
-  application showed that density, not precision, is now the gap:
-  deliberate exception fallbacks reported twice each, at seven findings
-  per 1,000 lines where the bar is one. The vulnerable apps test recall;
+- Precision on ordinary code is 11% strict and 30% lenient (18% and 50%
+  at `--confidence-min high`) on six apps, and three blind applications
+  in a row have read below the bar: 1.4 findings per 1,000 lines at 15%
+  lenient on the latest, where the bar is one at 35%. The vulnerable apps
+  test recall;
   the clean corpus shows what a team turning fenceline on sees first. Until
   that corpus reads above the bar set in `ROADMAP.md`, adopt fenceline on
   an existing codebase with a baseline file.
