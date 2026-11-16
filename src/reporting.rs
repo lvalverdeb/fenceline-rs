@@ -136,7 +136,7 @@ pub fn print_report(
             println!("  ({baseline_suppressed} pre-existing finding(s) suppressed by baseline)");
         }
         if nosec_suppressed > 0 {
-            println!("  ({nosec_suppressed} finding(s) suppressed by # nosec)");
+            println!("  ({nosec_suppressed} finding(s) suppressed by # nosec / # noqa)");
         }
         if test_suppressed > 0 {
             println!(
@@ -159,7 +159,7 @@ pub fn print_report(
         println!("  ({baseline_suppressed} pre-existing finding(s) suppressed by baseline)");
     }
     if nosec_suppressed > 0 {
-        println!("  ({nosec_suppressed} finding(s) suppressed by # nosec)");
+        println!("  ({nosec_suppressed} finding(s) suppressed by # nosec / # noqa)");
     }
     if test_suppressed > 0 {
         println!("  ({test_suppressed} finding(s) in test code suppressed — see --include-tests)");

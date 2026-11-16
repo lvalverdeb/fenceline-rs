@@ -197,6 +197,12 @@ pub struct CallRec {
     /// The first positional argument is a concatenation led by a route
     /// builder -- see `ast_helpers::is_route_builder_led`.
     pub first_arg_route_builder_led: bool,
+    /// Taint of the leading operand of a concatenation whose tail cannot
+    /// change the host -- see `ast_helpers::concat_lead`.
+    pub lead_taint: Option<Taint>,
+    /// The receiver of a method call is an attribute or subscript: a value
+    /// read off an object rather than a bare name.
+    pub receiver_is_access: bool,
     /// The sole argument is read off an object's URL namespace or URL
     /// property -- see `ast_helpers::url_property_kind`.
     pub sole_arg_url_property: Option<crate::ast_helpers::UrlProperty>,
@@ -613,6 +619,10 @@ impl<'a> Visitor for Collector<'a> {
             .args
             .first()
             .is_some_and(crate::ast_helpers::is_route_builder_led);
+        let receiver_is_access = matches!(
+            node.func.as_ref(),
+            Expr::Attribute(a) if matches!(a.value.as_ref(), Expr::Attribute(_) | Expr::Subscript(_))
+        );
         let sole_arg_url_property = sole_arg.and_then(crate::ast_helpers::url_property_kind);
         // Needed by check_eval_exec (re.compile/sqlalchemy .compile()
         // exclusion) -- computed here since it needs the *whole* Call node,
@@ -620,6 +630,11 @@ impl<'a> Visitor for Collector<'a> {
         let is_excluded_compile =
             fa == "compile" && (is_re_compile(&node) || is_sqlalchemy_compile(&node));
         let anchor = node.start();
+        let lead_taint = node
+            .args
+            .first()
+            .and_then(crate::ast_helpers::concat_lead)
+            .map(|e| self.taint.classify(anchor, [e]));
         let first_arg_bound_strs: Vec<String> = match node.args.first() {
             Some(Expr::Name(n)) => self
                 .taint
@@ -732,6 +747,8 @@ impl<'a> Visitor for Collector<'a> {
             first_arg_call_full_attr,
             first_arg_own_path,
             first_arg_route_builder_led,
+            lead_taint,
+            receiver_is_access,
             sole_arg_url_property,
             is_excluded_compile,
             allow_pickle_kw_line,

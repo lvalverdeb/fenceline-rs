@@ -273,6 +273,12 @@ const CLEAN_CALLS: &[&str] = &[
     "django.urls.reverse_lazy",
     "resolve_url",
     "django.shortcuts.resolve_url",
+    // Path sanitisers: None or an exception on traversal, else a path under the base.
+    "safe_join",
+    "werkzeug.security.safe_join",
+    "werkzeug.utils.safe_join",
+    "flask.safe_join",
+    "django.utils._os.safe_join",
 ];
 const CLEAN_METHODS: &[&str] = &[
     "isdigit",
@@ -896,6 +902,50 @@ const PREDICATE_METHODS: &[&str] = &[
     "isnumeric",
 ];
 
+fn const_key(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Constant(c) => match &c.value {
+            Constant::Str(s) => Some(format!("\"{s}\"")),
+            Constant::Int(i) => Some(i.to_string()),
+            Constant::Bool(b) => Some(if *b { "True" } else { "False" }.to_string()),
+            Constant::None => Some("None".to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A key for an expression a guard can vouch for -- mirrors
+/// `taint._canonical_expr`.
+fn canonical_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.to_string()),
+        Expr::Attribute(a) => canonical_expr(&a.value).map(|v| format!("{v}.{}", a.attr)),
+        Expr::Subscript(s) => Some(format!(
+            "{}[{}]",
+            canonical_expr(&s.value)?,
+            const_key(&s.slice)?
+        )),
+        Expr::Call(c) => {
+            let func = canonical_expr(&c.func)?;
+            let mut parts = Vec::new();
+            for a in &c.args {
+                parts.push(const_key(a)?);
+            }
+            for k in &c.keywords {
+                parts.push(format!("{}={}", k.arg.as_ref()?, const_key(&k.value)?));
+            }
+            Some(format!("{func}({})", parts.join(",")))
+        }
+        _ => None,
+    }
+}
+
+/// The name a guard key is rooted at -- mirrors `taint._guard_root`.
+fn guard_root(key: &str) -> &str {
+    key.split(['.', '(', '[']).next().unwrap_or(key)
+}
+
 fn name_of(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Name(n) => Some(n.id.to_string()),
@@ -911,7 +961,7 @@ fn anchored_match_target(call: &ExprCall) -> Option<String> {
         && PREDICATE_METHODS.contains(&a.attr.as_str())
     {
         return if call.args.is_empty() {
-            name_of(&a.value)
+            canonical_expr(&a.value)
         } else {
             None
         };
@@ -919,10 +969,10 @@ fn anchored_match_target(call: &ExprCall) -> Option<String> {
     let dotted = expr_dotted_name(&call.func);
     let args = &call.args;
     if URL_VALIDATORS.contains(&dotted.rsplit('.').next().unwrap_or("")) && !args.is_empty() {
-        return name_of(&args[0]);
+        return canonical_expr(&args[0]);
     }
     if dotted == "re.fullmatch" && args.len() >= 2 {
-        return name_of(&args[1]);
+        return canonical_expr(&args[1]);
     }
     if dotted == "re.match"
         && args.len() >= 2
@@ -930,13 +980,13 @@ fn anchored_match_target(call: &ExprCall) -> Option<String> {
         && let Constant::Str(pattern) = &k.value
         && (pattern.ends_with('$') || pattern.ends_with("\\Z"))
     {
-        return name_of(&args[1]);
+        return canonical_expr(&args[1]);
     }
     if let Expr::Attribute(a) = call.func.as_ref()
         && a.attr.as_str() == "fullmatch"
         && args.len() == 1
     {
-        return name_of(&args[0]);
+        return canonical_expr(&args[0]);
     }
     None
 }
@@ -1185,7 +1235,8 @@ impl ScopeIndexer {
                 other => self.visit_stmt(other),
             }
             if !killed.is_empty() {
-                self.guarded.retain(|(name, _)| !killed.contains(name));
+                self.guarded
+                    .retain(|(name, _)| !killed.contains(guard_root(name)));
             }
         }
         self.guarded = saved;
@@ -1661,9 +1712,33 @@ impl<'s> Classifier<'s> {
         worst
     }
 
+    /// A clean element (a constant, a sanitiser call) makes a clean sequence
+    /// whatever it iterates over.
+    fn comprehension<'e>(
+        &mut self,
+        elt: &Expr,
+        iters: impl Iterator<Item = &'e Expr>,
+        depth: u32,
+    ) -> Taint {
+        let elt = self.expr(elt, depth + 1);
+        if elt == Taint::Clean {
+            return Taint::Clean;
+        }
+        elt.max(self.many(iters, depth + 1))
+    }
+
     fn expr(&mut self, node: &Expr, depth: u32) -> Taint {
         if depth > MAX_DEPTH {
             return Taint::Internal;
+        }
+        if !self.clean_names.is_empty()
+            && matches!(
+                node,
+                Expr::Attribute(_) | Expr::Subscript(_) | Expr::Call(_)
+            )
+            && canonical_expr(node).is_some_and(|key| self.clean_names.contains(&key))
+        {
+            return Taint::Clean;
         }
         match node {
             Expr::Constant(_) => Taint::Clean,
@@ -1750,15 +1825,15 @@ impl<'s> Classifier<'s> {
             Expr::Await(a) => self.expr(&a.value, depth + 1),
             Expr::NamedExpr(n) => self.expr(&n.value, depth + 1),
             Expr::UnaryOp(u) => self.expr(&u.operand, depth + 1),
-            Expr::ListComp(c) => self
-                .expr(&c.elt, depth + 1)
-                .max(self.many(c.generators.iter().map(|g| &g.iter), depth + 1)),
-            Expr::SetComp(c) => self
-                .expr(&c.elt, depth + 1)
-                .max(self.many(c.generators.iter().map(|g| &g.iter), depth + 1)),
-            Expr::GeneratorExp(c) => self
-                .expr(&c.elt, depth + 1)
-                .max(self.many(c.generators.iter().map(|g| &g.iter), depth + 1)),
+            Expr::ListComp(c) => {
+                self.comprehension(&c.elt, c.generators.iter().map(|g| &g.iter), depth)
+            }
+            Expr::SetComp(c) => {
+                self.comprehension(&c.elt, c.generators.iter().map(|g| &g.iter), depth)
+            }
+            Expr::GeneratorExp(c) => {
+                self.comprehension(&c.elt, c.generators.iter().map(|g| &g.iter), depth)
+            }
             Expr::DictComp(c) => self
                 .expr(&c.key, depth + 1)
                 .max(self.expr(&c.value, depth + 1))

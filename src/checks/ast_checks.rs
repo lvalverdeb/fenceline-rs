@@ -1164,7 +1164,7 @@ pub fn check_open_redirect(
                 (Some(UrlProperty::Namespace), _) | (Some(UrlProperty::Property), Taint::Internal)
             )
         })
-        .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
+        .filter_map(|c| confidence_for(c.lead_taint.unwrap_or(c.data_taint)).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(
                 "CWE-601",
@@ -1731,6 +1731,11 @@ pub fn check_path_traversal(
         } else {
             continue;
         };
+        if c.call_name == "lstrip" && taint == Taint::Internal && c.receiver_is_access {
+            // A field read off the application's own object, normalised; a
+            // bare name of unknown provenance stays reported at MEDIUM.
+            continue;
+        }
         let Some((confidence, note)) = confidence_for(taint) else {
             continue;
         };
@@ -2075,7 +2080,7 @@ static PASSWORD_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)password|passwd|pwd").unwrap());
 static NOT_A_SECRET_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:^|_)(?:field|name|param|prefix|suffix|type|kind|url|uri|hint|label|help|placeholder|regex|pattern|length|len|path|file|algorithm|salt|provider|status|id)(?:_|$)|header$|^(?:conf|key|data|storage|attr|setting|option)_|(?:^|_)(?:reset|change|forgot|confirm|validate|verify)_password(?:_|$)",
+        r"(?i)(?:^|_)(?:field|name|param|prefix|suffix|type|kind|url|uri|hint|label|help|placeholder|regex|pattern|length|len|path|file|algorithm|salt|provider|status|id)(?:_|$)|header$|^(?:conf|key|data|storage|attr|setting|option)_|(?:^|_)(?:reset|change|forgot|confirm|validate|verify)_password(?:_|$)|(?:^|_)password_(?:reset|change|changed|forgot|confirm|validate|verify|alert|expired|expiry|policy)(?:_|$)",
     )
     .unwrap()
 });

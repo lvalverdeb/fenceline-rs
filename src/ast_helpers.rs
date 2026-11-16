@@ -149,6 +149,18 @@ pub fn has_log_like_token(full_name: &str) -> bool {
 /// anywhere in the body -- `print(f"...{exc}")`, `metrics.record(exc)`,
 /// not just a `logging`-module call -- counts as surfacing the exception
 /// through some other mechanism, not silently swallowing it.
+const OUTPUT_FUNCS: &[&str] = &[
+    "print",
+    "pprint",
+    "abort",
+    "exit",
+    "sys.exit",
+    "click.echo",
+    "click.secho",
+    "typer.echo",
+    "typer.secho",
+];
+
 pub fn handler_has_diagnostic(body: &[Stmt], bound_name: Option<&str>) -> bool {
     let mut visitor = DiagnosticVisitor {
         found: false,
@@ -210,6 +222,15 @@ impl Visitor for DiagnosticVisitor {
             full.rsplit('.').next().unwrap_or(""),
             "print_exc" | "print_exception" | "print_stack" | "format_exc"
         ) {
+            self.found = true;
+        }
+        // print()/echo() write the failure where a person sees it; abort()/
+        // exit() end the request or program -- mirrors `_OUTPUT_FUNCS`.
+        if OUTPUT_FUNCS.contains(&full.as_str()) {
+            self.found = true;
+        }
+        let mut tail = full.rsplit('.');
+        if tail.next() == Some("write") && matches!(tail.next(), Some("stdout" | "stderr")) {
             self.found = true;
         }
         self.generic_visit_expr_call(node);
@@ -756,4 +777,38 @@ pub fn is_route_builder_led(target: &Expr) -> bool {
         Expr::Call(c) => ROUTE_BUILDERS.contains(&full_attr(&c.func).as_str()),
         _ => false,
     }
+}
+
+fn concat_operands<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinOp(b) if matches!(b.op, Operator::Add) => {
+            concat_operands(&b.left, out);
+            concat_operands(&b.right, out);
+        }
+        Expr::JoinedStr(j) => {
+            for v in &j.values {
+                if let Expr::FormattedValue(f) = v {
+                    out.push(&f.value);
+                }
+            }
+        }
+        _ => out.push(expr),
+    }
+}
+
+fn is_safe_tail(op: &Expr) -> bool {
+    matches!(op, Expr::Constant(c) if matches!(c.value, Constant::Str(_)))
+        || is_request_own_path(op)
+        || matches!(op, Expr::Call(c) if ROUTE_BUILDERS.contains(&full_attr(&c.func).as_str()))
+}
+
+/// The leading operand of a concatenation whose other operands cannot change
+/// the destination's host -- mirrors `ast_checks._concat_lead`.
+pub fn concat_lead(target: &Expr) -> Option<&Expr> {
+    let mut ops = Vec::new();
+    concat_operands(target, &mut ops);
+    (ops.len() >= 2
+        && !matches!(ops[0], Expr::Constant(_))
+        && ops[1..].iter().all(|o| is_safe_tail(o)))
+    .then(|| ops[0])
 }
