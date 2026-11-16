@@ -208,24 +208,30 @@ The check-shape work in 1.10.0 brings fenceline to 20%
 (23 true in 116) and to 42% at `--confidence-min high`, where it reports
 one finding per 3,000 lines and seven in ten are real or deliberate; the
 vulnerable-app numbers moved to 96% precision and 98% at HIGH with no
-recall change. A fifth application scanned blind after that tuning
-(pretalx, Django, 64,000 lines) reads 0% precise at 224 findings: three
-shapes the tuning set did not contain, chiefly URL properties built by
-urlman and Django's `get_success_url()` idiom reported as open redirects.
-The held-out number is the one a team should expect today; closing those
-shapes and re-measuring on a further application is the current work
-(`ROADMAP.md`).
+recall change. Those numbers described the four apps the checks were
+tuned on: a fifth application scanned blind afterwards (pretalx, Django,
+64,000 lines) read 0% precise at 224 findings, almost all of them URL
+properties built by urlman and Django's `get_success_url()` idiom reported
+as open redirects. Fixing those shapes and folding pretalx into the corpus
+gives, on five apps and 193,000 lines, 12% strict and 24% lenient
+precision at one finding per 1,000 lines (23% and 42% at
+`--confidence-min high`). The next blind application (Tandoor Recipes,
+Django, 20,000 lines) reads 3% strict but 65% lenient (83% at HIGH) at
+seven findings per 1,000 lines: nearly every finding there is a deliberate
+`except Exception:` fallback, reported by two checks at once. The blind
+numbers are the ones a team should expect today; the handler shape is the
+next item (`ROADMAP.md`).
 
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- Precision on ordinary code is 20% (42% at `--confidence-min high`) at
-  1.10.0 on the apps the checks were tuned on, and 0% on the one scanned
-  blind afterwards. The tuning set's residue is type-shaped (request fields
-  reaching a logger through a service layer, administrator-configured
-  outbound URLs); the held-out app's is check-shaped and next in line. The vulnerable apps test recall;
+- Precision on ordinary code is 12% strict and 24% lenient (23% and 42%
+  at `--confidence-min high`) on five apps, and the second blind
+  application showed that density, not precision, is now the gap:
+  deliberate exception fallbacks reported twice each, at seven findings
+  per 1,000 lines where the bar is one. The vulnerable apps test recall;
   the clean corpus shows what a team turning fenceline on sees first. Until
   that corpus reads above the bar set in `ROADMAP.md`, adopt fenceline on
   an existing codebase with a baseline file.
@@ -291,7 +297,13 @@ field nothing in the class assigns stays `MEDIUM`. The name `request` counts
 as web input only inside a handler or in a module that imports a web
 framework (Flask, Django, aiohttp, Starlette, FastAPI and the like) anywhere,
 even lazily; in a client library that builds outbound requests, or after
-`from urllib import request`, it resolves like any other name. Use
+`from urllib import request`, it resolves like any other name. Two or more
+attributes under `request` whose first is not a data attribute of those
+frameworks (`request.user.email`, `request.session.get(...)`,
+`request.event.urls.base`) are state the framework or a middleware
+attached, not what the client sent, and land in the `MEDIUM` row; a data
+attribute (`request.GET`, `request.headers`, `request.json`) or a single
+unknown one (`request.body`) is a source. Use
 `--confidence-min medium` to cut noise from the fuzzier regex checks, and
 `--confidence-min high` to see only findings where attacker-controlled input
 provably reaches the sink.
