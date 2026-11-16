@@ -423,37 +423,20 @@ fn bool_value(e: &Expr) -> Option<bool> {
 
 /// Every identifier (bare name or attribute) inside `e` -- mirrors the
 /// `ast.walk`-based `_names_in` for the expression shapes arguments take.
+/// Every identifier (bare name or attribute) anywhere inside `e` --
+/// mirrors `ast_checks._names_in`, which walks the whole expression.
 fn names_in_expr(e: &Expr, out: &mut Vec<String>) {
-    match e {
-        Expr::Name(n) => out.push(n.id.to_string()),
-        Expr::Attribute(a) => {
-            out.push(a.attr.to_string());
-            names_in_expr(&a.value, out);
+    struct Collector<'a>(&'a mut Vec<String>);
+    impl Visitor for Collector<'_> {
+        fn visit_expr_name(&mut self, node: rustpython_ast::ExprName) {
+            self.0.push(node.id.to_string());
         }
-        Expr::Call(c) => {
-            names_in_expr(&c.func, out);
-            for a in &c.args {
-                names_in_expr(a, out);
-            }
-            for kw in &c.keywords {
-                names_in_expr(&kw.value, out);
-            }
+        fn visit_expr_attribute(&mut self, node: rustpython_ast::ExprAttribute) {
+            self.0.push(node.attr.to_string());
+            self.generic_visit_expr_attribute(node);
         }
-        Expr::BinOp(b) => {
-            names_in_expr(&b.left, out);
-            names_in_expr(&b.right, out);
-        }
-        Expr::JoinedStr(j) => j.values.iter().for_each(|v| names_in_expr(v, out)),
-        Expr::FormattedValue(f) => names_in_expr(&f.value, out),
-        Expr::Subscript(s) => {
-            names_in_expr(&s.value, out);
-            names_in_expr(&s.slice, out);
-        }
-        Expr::Tuple(t) => t.elts.iter().for_each(|v| names_in_expr(v, out)),
-        Expr::List(l) => l.elts.iter().for_each(|v| names_in_expr(v, out)),
-        Expr::Starred(s) => names_in_expr(&s.value, out),
-        _ => {}
     }
+    Collector(out).visit_expr(e.clone());
 }
 
 const WEAK_TLS_PROTOCOLS: &[&str] = &[

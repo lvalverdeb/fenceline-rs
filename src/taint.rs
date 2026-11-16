@@ -1813,9 +1813,10 @@ impl<'s> Classifier<'s> {
                     .max(self.many(c.keywords.iter().map(|kw| &kw.value), depth + 1))
             }
             Expr::JoinedStr(j) => self.many(
-                j.values
-                    .iter()
-                    .filter(|v| matches!(v, Expr::FormattedValue(_))),
+                j.values.iter().filter_map(|v| match v {
+                    Expr::FormattedValue(f) => Some(f.value.as_ref()),
+                    _ => None,
+                }),
                 depth + 1,
             ),
             Expr::FormattedValue(f) => self.expr(&f.value, depth + 1),

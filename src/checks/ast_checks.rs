@@ -459,9 +459,7 @@ pub fn check_pandas_eval(
                 "pandas.eval() evaluates arbitrary Python expressions — code injection if user input reaches the expression.",
                 "CVE-2024-9880 / Trail of Bits: pandas.eval() / df.query() sandbox bypass via dunder methods. Pandas docs now warn explicitly.",
             )
-        } else if matches!(c.full_attr.rsplit('.').next(), Some("eval") | Some("query"))
-            && c.full_attr.contains('.')
-        {
+        } else if matches!(c.call_name.as_str(), "eval" | "query") && !c.func_is_bare_name {
             if is_sqlalchemy_query(c) {
                 continue;
             }

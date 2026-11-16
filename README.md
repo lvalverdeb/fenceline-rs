@@ -236,7 +236,10 @@ handling) and with Mealie in the corpus, eight apps and 280,000 lines read
 `--confidence-min high`, 0.5 per 1,000). The precision work (`ROADMAP.md`,
 C2) closed there, with the corpus as the regression gate; the blind numbers,
 one to two findings per 1,000 lines, are the ones a team should expect on
-day one.
+day one. On recall against bugs that shipped, a set of 28 real CVEs pinned
+at their last vulnerable commit (`benchmark/cves/`) reads 15 of the 22 in
+classes fenceline claims found, 12 at HIGH, with every miss attributed to
+a cause; the six in classes it does not claim are missed by construction.
 
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
