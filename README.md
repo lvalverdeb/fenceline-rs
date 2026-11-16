@@ -237,7 +237,7 @@ handling) and with Mealie in the corpus, eight apps and 280,000 lines read
 C2) closed there, with the corpus as the regression gate; the blind numbers,
 one to two findings per 1,000 lines, are the ones a team should expect on
 day one. On recall against bugs that shipped, a set of 28 real CVEs pinned
-at their last vulnerable commit (`benchmark/cves/`) reads 17 of the 22 in
+at their last vulnerable commit (`benchmark/cves/`) reads 18 of the 22 in
 classes fenceline claims found, 12 at HIGH, with every miss attributed to
 a cause; the six in classes it does not claim are missed by construction.
 
