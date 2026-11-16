@@ -1347,8 +1347,20 @@ pub fn check_exec_driver_sql(
 }
 
 const SSRF_METHOD_NAMES: &[&str] = &[
-    "get", "post", "put", "patch", "delete", "head", "options", "request",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "head",
+    "options",
+    "request",
+    "build_request",
 ];
+/// `x.request(method, url)` / `client.build_request(method, url)`: the URL is
+/// the second positional argument and the shape marks an HTTP client by
+/// itself -- mirrors `ast_checks._SSRF_METHOD_THEN_URL`.
+const SSRF_METHOD_THEN_URL: &[&str] = &["request", "build_request"];
 const SSRF_SESSION_CONSTRUCTORS: &[&str] = &[
     "requests.Session",
     "httpx.Client",
@@ -1356,8 +1368,13 @@ const SSRF_SESSION_CONSTRUCTORS: &[&str] = &[
     "aiohttp.ClientSession",
 ];
 
-fn ssrf_url_arg(call: &ExprCall) -> Option<&Expr> {
-    call.args.first().or_else(|| {
+fn ssrf_url_arg<'a>(call: &'a ExprCall, method: &str) -> Option<&'a Expr> {
+    let positional = if SSRF_METHOD_THEN_URL.contains(&method) {
+        call.args.get(1)
+    } else {
+        call.args.first()
+    };
+    positional.or_else(|| {
         call.keywords
             .iter()
             .find(|kw| kw.arg.as_ref().is_some_and(|a| a.as_str() == "url"))
@@ -1388,16 +1405,20 @@ pub fn check_ssrf(
         if !is_module_call
             && is_method
             && let Expr::Attribute(attr) = scoped.call.func.as_ref()
-            && let Expr::Name(base) = attr.value.as_ref()
-            && let Some(Expr::Call(bound)) = scoped.literals.get(base.id.as_str())
         {
-            let ctor = resolve_dotted(&full_attr(&bound.func), aliases);
-            is_session_call = SSRF_SESSION_CONSTRUCTORS.contains(&ctor.as_str());
+            if SSRF_METHOD_THEN_URL.contains(&method.as_str()) {
+                is_session_call = ssrf_url_arg(&scoped.call, &method).is_some();
+            } else if let Expr::Name(base) = attr.value.as_ref()
+                && let Some(Expr::Call(bound)) = scoped.literals.get(base.id.as_str())
+            {
+                let ctor = resolve_dotted(&full_attr(&bound.func), aliases);
+                is_session_call = SSRF_SESSION_CONSTRUCTORS.contains(&ctor.as_str());
+            }
         }
         if !(is_module_call || is_session_call) {
             continue;
         }
-        let Some(url) = ssrf_url_arg(&scoped.call) else {
+        let Some(url) = ssrf_url_arg(&scoped.call, &method) else {
             continue;
         };
         let taint = tree.taint().classify(scoped.call.start(), [url]);
