@@ -8,4 +8,4 @@ except Exception:
 try:
     configure()
 except Exception:
-    pass
+    cleanup()

@@ -86,7 +86,7 @@ pub fn check_insufficient_logging(
     collected
         .excepts
         .iter()
-        .filter(|e| (e.is_bare || e.is_exception_name) && !e.has_diagnostic)
+        .filter(|e| (e.is_bare || e.is_exception_name) && !e.has_diagnostic && !e.is_fallback)
         .map(|e| Finding {
             cwe_id: "CWE-778",
             cwe_name: "Insufficient Logging",
@@ -1157,6 +1157,7 @@ pub fn check_open_redirect(
         .filter(|c| c.first_arg_str.is_none())
         .filter(|c| !c.data_leading_str.as_deref().is_some_and(is_same_site_path))
         .filter(|c| !c.first_arg_own_path)
+        .filter(|c| !c.first_arg_route_builder_led)
         .filter(|c| {
             !matches!(
                 (c.sole_arg_url_property, c.data_taint),
@@ -2074,7 +2075,7 @@ static PASSWORD_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)password|passwd|pwd").unwrap());
 static NOT_A_SECRET_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:^|_)(?:field|name|param|prefix|suffix|type|kind|url|uri|hint|label|help|placeholder|regex|pattern|length|len|path|file|algorithm|salt|provider|status|id)(?:_|$)|header$|^(?:conf|key|data|storage|attr|setting|option)_",
+        r"(?i)(?:^|_)(?:field|name|param|prefix|suffix|type|kind|url|uri|hint|label|help|placeholder|regex|pattern|length|len|path|file|algorithm|salt|provider|status|id)(?:_|$)|header$|^(?:conf|key|data|storage|attr|setting|option)_|(?:^|_)(?:reset|change|forgot|confirm|validate|verify)_password(?:_|$)",
     )
     .unwrap()
 });
@@ -2162,6 +2163,8 @@ fn classify_secret(name: &str, value: &str) -> Option<(Severity, Confidence, Str
         || CONSTANT_NAME_RE.is_match(value)
         // aliases = {"secretsmanager": "secrets-manager"}: a name, not a credential.
         || (normalised(value) == normalised(name) && !value.contains(' '))
+        // A URL or filesystem path: where the secret is, not the secret.
+        || (value.starts_with('/') && !value.contains(' '))
     {
         return None;
     }

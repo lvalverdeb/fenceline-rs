@@ -10,7 +10,7 @@ use crate::analysis::ParsedFile;
 use crate::ast_helpers::skip;
 use crate::models::{Confidence, Finding, Severity};
 use regex::{Regex, RegexBuilder};
-use rustpython_ast::{ModModule, StmtImport, StmtImportFrom, Visitor};
+use rustpython_ast::{Constant, Expr, ModModule, StmtAssign, StmtImport, StmtImportFrom, Visitor};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -93,14 +93,100 @@ fn lxml_etree_alias(tree: &ModModule) -> Option<String> {
     finder.alias
 }
 
+/// `from xml.etree.ElementTree import Element, SubElement` -- mirrors `_XML_IMPORT_RE`.
+static XML_IMPORT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*from\s+xml\.[\w.]+\s+import\s+([\w\s,]+?)\s*$").unwrap());
+/// Builders and serialisers, not parsers -- mirrors `_XML_NON_PARSERS`.
+const XML_NON_PARSERS: &[&str] = &[
+    "Element",
+    "SubElement",
+    "tostring",
+    "tostringlist",
+    "indent",
+    "register_namespace",
+    "QName",
+    "Comment",
+    "ProcessingInstruction",
+    "dump",
+    "Document",
+    "escape",
+    "quoteattr",
+    "unescape",
+];
+
+fn imports_only_non_parsers(line: &str) -> bool {
+    let Some(m) = XML_IMPORT_RE.captures(line) else {
+        return false;
+    };
+    let mut any = false;
+    for part in m[1].split(',') {
+        let name = part.trim().split(' ').next().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        any = true;
+        if !XML_NON_PARSERS.contains(&name) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Names bound to an lxml `XMLParser(...)` constructed with
+/// `resolve_entities=False` -- mirrors `_defused_parser_names`.
+#[derive(Default)]
+struct DefusedParserFinder {
+    names: Vec<String>,
+}
+
+impl Visitor for DefusedParserFinder {
+    fn visit_stmt_assign(&mut self, node: StmtAssign) {
+        if let Expr::Call(c) = node.value.as_ref()
+            && matches!(c.func.as_ref(), Expr::Attribute(a) if a.attr.as_str() == "XMLParser")
+            && c.keywords.iter().any(|k| {
+                k.arg.as_ref().is_some_and(|a| a.as_str() == "resolve_entities")
+                    && matches!(&k.value, Expr::Constant(kc) if matches!(kc.value, Constant::Bool(false)))
+            })
+        {
+            for t in &node.targets {
+                if let Expr::Name(n) = t {
+                    self.names.push(n.id.to_string());
+                }
+            }
+        }
+        self.generic_visit_stmt_assign(node);
+    }
+}
+
+fn defused_parser_names(tree: &ModModule) -> Vec<String> {
+    let mut finder = DefusedParserFinder::default();
+    for stmt in tree.body.clone() {
+        finder.visit_stmt(stmt);
+    }
+    finder.names
+}
+
 pub fn check_xxe(_path: &Path, pk: &str, lines: Lines, tree: Option<&ParsedFile>) -> Vec<Finding> {
     let lxml_pattern = tree
         .and_then(|t| lxml_etree_alias(&t.module))
         .map(|alias| Regex::new(&format!(r"\b{}\.", regex::escape(&alias))).unwrap());
+    let defused = tree
+        .map(|t| defused_parser_names(&t.module))
+        .unwrap_or_default();
+    let defused_pattern = (!defused.is_empty()).then(|| {
+        let alts: Vec<String> = defused.iter().map(|n| regex::escape(n)).collect();
+        Regex::new(&format!(r"\bparser\s*=\s*(?:{})\b", alts.join("|"))).unwrap()
+    });
     let mut results = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if skip(line) || line.contains("xml.sax.saxutils") {
             continue; // saxutils is the escaping helper, not a parser
+        }
+        if line.contains("resolve_entities=False")
+            || imports_only_non_parsers(line)
+            || defused_pattern.as_ref().is_some_and(|p| p.is_match(line))
+        {
+            continue;
         }
         let lxml_hit = lxml_pattern.as_ref().is_some_and(|p| p.is_match(line));
         if XXE_RE.is_match(line) || lxml_hit {
@@ -214,6 +300,17 @@ pub fn check_supply_chain(
 
 // ── check_sensitive_exposure (CWE-200) ───────────────────────────────────
 
+/// Traceback text on a line that hands something back to the client --
+/// mirrors `_TRACEBACK_TEXT_RE` / `_RESPONSE_LINE_RE`.
+static TRACEBACK_TEXT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"traceback\.format_exc(?:eption)?\(").unwrap());
+static RESPONSE_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\breturn\b|Response\(|render|jsonify\(|make_response\(|\.write\(|abort\(|HTTPException\(",
+    )
+    .unwrap()
+});
+
 pub fn check_sensitive_exposure(
     _path: &Path,
     pk: &str,
@@ -225,7 +322,7 @@ pub fn check_sensitive_exposure(
         if skip(line) {
             continue;
         }
-        if line.contains("traceback.print_exc") || line.contains("traceback.print_exception") {
+        if TRACEBACK_TEXT_RE.is_match(line) && RESPONSE_LINE_RE.is_match(line) {
             results.push(finding(
                 "CWE-200",
                 "Information Exposure",
@@ -234,7 +331,7 @@ pub fn check_sensitive_exposure(
                 pk,
                 i + 1,
                 line.trim(),
-                "traceback.print_exc() may leak internal paths / stack traces to users."
+                "Traceback text returned to the client — leaks internal paths and stack frames; log it and return a generic error."
                     .to_string(),
                 "",
             ));

@@ -1,4 +1,4 @@
 try:
     risky()
 except Exception:
-    pass
+    retry()

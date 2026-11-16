@@ -194,6 +194,9 @@ pub struct CallRec {
     /// The first positional argument is the request's own path, possibly
     /// with a query string appended -- see `ast_helpers::is_request_own_path`.
     pub first_arg_own_path: bool,
+    /// The first positional argument is a concatenation led by a route
+    /// builder -- see `ast_helpers::is_route_builder_led`.
+    pub first_arg_route_builder_led: bool,
     /// The sole argument is read off an object's URL namespace or URL
     /// property -- see `ast_helpers::url_property_kind`.
     pub sole_arg_url_property: Option<crate::ast_helpers::UrlProperty>,
@@ -240,6 +243,8 @@ pub struct ExceptRec {
     pub single_pass: bool,
     pub single_continue: bool,
     pub has_diagnostic: bool,
+    /// Every statement substitutes an outcome -- see `ast_helpers::is_fallback_handler`.
+    pub is_fallback: bool,
 }
 
 pub struct FuncDefRec {
@@ -604,6 +609,10 @@ impl<'a> Visitor for Collector<'a> {
             .args
             .first()
             .is_some_and(crate::ast_helpers::is_request_own_path);
+        let first_arg_route_builder_led = node
+            .args
+            .first()
+            .is_some_and(crate::ast_helpers::is_route_builder_led);
         let sole_arg_url_property = sole_arg.and_then(crate::ast_helpers::url_property_kind);
         // Needed by check_eval_exec (re.compile/sqlalchemy .compile()
         // exclusion) -- computed here since it needs the *whole* Call node,
@@ -722,6 +731,7 @@ impl<'a> Visitor for Collector<'a> {
             keyword_true_names,
             first_arg_call_full_attr,
             first_arg_own_path,
+            first_arg_route_builder_led,
             sole_arg_url_property,
             is_excluded_compile,
             allow_pickle_kw_line,
@@ -750,6 +760,7 @@ impl<'a> Visitor for Collector<'a> {
         let single_continue = node.body.len() == 1 && matches!(node.body[0], Stmt::Continue(_));
         let has_diagnostic =
             crate::ast_helpers::handler_has_diagnostic(&node.body, node.name.as_deref());
+        let is_fallback = crate::ast_helpers::is_fallback_handler(&node.body);
         self.out.excepts.push(ExceptRec {
             line,
             is_bare,
@@ -757,6 +768,7 @@ impl<'a> Visitor for Collector<'a> {
             single_pass,
             single_continue,
             has_diagnostic,
+            is_fallback,
         });
         self.generic_visit_excepthandler_except_handler(node);
     }

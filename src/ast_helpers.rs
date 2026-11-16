@@ -693,3 +693,67 @@ pub fn url_property_kind(target: &Expr) -> Option<UrlProperty> {
     }
     None
 }
+
+/// The handler does nothing but substitute an outcome -- mirrors
+/// `ast_helpers._is_fallback_handler`.
+pub fn is_fallback_handler(body: &[Stmt]) -> bool {
+    body.iter().all(is_fallback_stmt)
+}
+
+fn is_fallback_stmt(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Pass(_) | Stmt::Continue(_) | Stmt::Break(_) => true,
+        Stmt::Return(r) => r.value.as_deref().is_none_or(|v| !contains_call(v)),
+        Stmt::Assign(a) => !contains_call(&a.value),
+        Stmt::AnnAssign(a) => a.value.as_deref().is_some_and(|v| !contains_call(v)),
+        Stmt::AugAssign(a) => !contains_call(&a.value),
+        Stmt::Try(t) => {
+            t.orelse.is_empty()
+                && t.finalbody.is_empty()
+                && t.handlers.iter().all(|h| {
+                    let rustpython_ast::ExceptHandler::ExceptHandler(h) = h;
+                    is_fallback_handler(&h.body)
+                })
+        }
+        _ => false,
+    }
+}
+
+struct CallFinder {
+    found: bool,
+}
+
+impl Visitor for CallFinder {
+    fn visit_expr_call(&mut self, node: ExprCall) {
+        self.found = true;
+        self.generic_visit_expr_call(node);
+    }
+}
+
+fn contains_call(expr: &Expr) -> bool {
+    let mut finder = CallFinder { found: false };
+    finder.visit_expr(expr.clone());
+    finder.found
+}
+
+/// Route builders: a same-site URL from a route name -- mirrors
+/// `ast_checks._ROUTE_BUILDERS`.
+const ROUTE_BUILDERS: &[&str] = &[
+    "url_for",
+    "flask.url_for",
+    "reverse",
+    "reverse_lazy",
+    "django.urls.reverse",
+    "django.urls.reverse_lazy",
+    "resolve_url",
+    "django.shortcuts.resolve_url",
+];
+
+/// A concatenation led by a route builder (`reverse("login") + "?next=" +
+/// request.path`) -- mirrors `ast_checks._is_route_builder_led`.
+pub fn is_route_builder_led(target: &Expr) -> bool {
+    match leading_operand(target) {
+        Expr::Call(c) => ROUTE_BUILDERS.contains(&full_attr(&c.func).as_str()),
+        _ => false,
+    }
+}
