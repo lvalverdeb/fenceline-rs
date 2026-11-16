@@ -289,6 +289,15 @@ pub struct EqCompareRec {
     pub literal: String,
 }
 
+/// `a == b` with neither side a string literal -- mirrors the two-value
+/// branch of `ast_checks.check_timing_attack`.
+#[derive(Debug, Clone)]
+pub struct ValueCompareRec {
+    pub line: usize,
+    pub names: [String; 2],
+    pub has_constant: bool,
+}
+
 /// The name of the value an operand denotes: `token` for `token`,
 /// `self.token`, `d["token"]`, `headers.get("token")` and `token.strip()`;
 /// `""` when there is none -- mirrors `ast_checks._compared_name`.
@@ -345,6 +354,7 @@ pub struct Collected {
     /// Every `x == "lit"` / `x != "lit"` operand pair (either order):
     /// `(line, compared name, literal)` -- see `ast_checks._compared_name`.
     pub eq_compares: Vec<EqCompareRec>,
+    pub value_compares: Vec<ValueCompareRec>,
     pub funcdefs: Vec<FuncDefRec>,
     pub assigns: Vec<AssignRec>,
     pub ann_assigns: Vec<AssignRec>,
@@ -852,6 +862,14 @@ impl<'a> Visitor for Collector<'a> {
         operands.extend(node.comparators.iter());
         for (op, pair) in node.ops.iter().zip(operands.windows(2)) {
             if !matches!(op, CmpOp::Eq | CmpOp::NotEq) {
+                continue;
+            }
+            if str_const(pair[0]).is_none() && str_const(pair[1]).is_none() {
+                self.out.value_compares.push(ValueCompareRec {
+                    line,
+                    names: [compared_name(pair[0]), compared_name(pair[1])],
+                    has_constant: pair.iter().any(|e| matches!(e, Expr::Constant(_))),
+                });
                 continue;
             }
             for (lit, other) in [(pair[0], pair[1]), (pair[1], pair[0])] {

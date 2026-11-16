@@ -2374,6 +2374,30 @@ pub fn check_timing_attack(
     let Some(tree) = tree else { return vec![] };
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let is_upper =
+        |n: &str| n.chars().any(char::is_alphabetic) && !n.chars().any(char::is_lowercase);
+    for cmp in &tree.collected().value_compares {
+        let secret = cmp.names.iter().filter(|n| is_secret_name(n)).count();
+        if secret != 1
+            || cmp.names.iter().any(|n| is_upper(n))
+            || cmp.has_constant
+            || !seen.insert(cmp.line)
+        {
+            continue;
+        }
+        results.push(ast_finding(
+            "CWE-208",
+            "Timing Attack",
+            Severity::Low,
+            Confidence::Low,
+            pk,
+            lines,
+            cmp.line,
+            "Secret compared with == may leak timing information. Use secrets.compare_digest()."
+                .to_string(),
+            "",
+        ));
+    }
     for cmp in &tree.collected().eq_compares {
         // token != "None": a sentinel test, not a secret comparison.
         if LITERAL_WORDS.contains(&cmp.literal.as_str())
