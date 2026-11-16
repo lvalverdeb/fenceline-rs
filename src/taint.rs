@@ -190,6 +190,9 @@ const REQUEST_DATA_ATTRS: &[&str] = &[
 /// Framework URL validators that vouch for their first argument as a
 /// same-site destination -- mirrors `taint._URL_VALIDATORS`.
 const URL_VALIDATORS: &[&str] = &["url_has_allowed_host_and_scheme", "is_safe_url"];
+/// `path.is_relative_to(base)` vouches for its receiver -- mirrors
+/// `taint._PATH_GUARD_METHODS`.
+const PATH_GUARD_METHODS: &[&str] = &["is_relative_to"];
 /// Top-level module names whose import marks a module as web-facing.
 const WEB_FRAMEWORKS: &[&str] = &[
     "aiohttp",
@@ -965,6 +968,12 @@ fn anchored_match_target(call: &ExprCall) -> Option<String> {
         } else {
             None
         };
+    }
+    if let Expr::Attribute(a) = call.func.as_ref()
+        && PATH_GUARD_METHODS.contains(&a.attr.as_str())
+        && call.args.len() == 1
+    {
+        return canonical_expr(&a.value);
     }
     let dotted = expr_dotted_name(&call.func);
     let args = &call.args;

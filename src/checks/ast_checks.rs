@@ -86,7 +86,12 @@ pub fn check_insufficient_logging(
     collected
         .excepts
         .iter()
-        .filter(|e| (e.is_bare || e.is_exception_name) && !e.has_diagnostic && !e.is_fallback)
+        .filter(|e| {
+            (e.is_bare || e.is_exception_name)
+                && !e.has_diagnostic
+                && !e.is_fallback
+                && !e.returns_error_response
+        })
         .map(|e| Finding {
             cwe_id: "CWE-778",
             cwe_name: "Insufficient Logging",
@@ -732,6 +737,14 @@ pub fn check_huggingface_unsafe_download(
 
 // ── check_unbounded_pydantic_field (CWE-770 / OWASP API4:2023) ───────────
 
+/// Field names that carry bulk content -- mirrors `ast_checks._BULK_FIELD_RE`.
+static BULK_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|_)(?:contents?|body|data|payload|html|text|images?|img|files?|blob|base64|markdown|description|notes?|csv|json|xml|document|attachments?|avatar|picture|photo|message|comment)(?:_|$)",
+    )
+    .unwrap()
+});
+
 pub fn check_unbounded_pydantic_field(
     _path: &Path,
     pk: &str,
@@ -744,7 +757,7 @@ pub fn check_unbounded_pydantic_field(
     collected
         .pydantic_fields
         .iter()
-        .filter(|f| !f.has_constraint)
+        .filter(|f| !f.has_constraint && BULK_FIELD_RE.is_match(&f.field_name))
         .map(|f| Finding {
             cwe_id: "CWE-770",
             cwe_name: "Unbounded Request Field Size",
@@ -1506,7 +1519,7 @@ pub fn check_arbitrary_write(
         .calls
         .iter()
         .filter(|c| is_file_move_or_copy(&c.full_attr))
-        .filter_map(|c| confidence_for(c.data_taint).map(|t| (c, t)))
+        .filter_map(|c| confidence_for(c.dest_taint).map(|t| (c, t)))
         .map(|(c, (confidence, note))| {
             ast_finding(
                 "CWE-73",

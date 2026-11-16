@@ -218,6 +218,9 @@ pub struct CallRec {
     pub allow_pickle_kw_line: Option<usize>,
     /// Taint of every positional and keyword argument (`_call_data`).
     pub data_taint: Taint,
+    /// Taint of a copy/move's destination: the second positional argument or
+    /// `dst=`, else `data_taint` -- mirrors `ast_checks._write_destination`.
+    pub dest_taint: Taint,
     /// Taint of the positional arguments plus `args=`/`cmd=` -- the command
     /// a subprocess call runs, without `shell=`/`cwd=`/`env=`.
     pub command_taint: Taint,
@@ -251,6 +254,8 @@ pub struct ExceptRec {
     pub has_diagnostic: bool,
     /// Every statement substitutes an outcome -- see `ast_helpers::is_fallback_handler`.
     pub is_fallback: bool,
+    /// A `return` of an error response -- see `ast_helpers::handler_returns_error_response`.
+    pub returns_error_response: bool,
 }
 
 pub struct FuncDefRec {
@@ -651,6 +656,17 @@ impl<'a> Visitor for Collector<'a> {
                 .iter()
                 .chain(node.keywords.iter().map(|kw| &kw.value)),
         );
+        let dest_taint = if node.args.len() >= 2 {
+            self.taint.classify(anchor, [&node.args[1]])
+        } else if let Some(kw) = node.keywords.iter().find(|kw| {
+            kw.arg
+                .as_ref()
+                .is_some_and(|a| matches!(a.as_str(), "dst" | "fdst" | "dest"))
+        }) {
+            self.taint.classify(anchor, [&kw.value])
+        } else {
+            data_taint
+        };
         let command_taint = self.taint.classify(
             anchor,
             node.args.iter().chain(
@@ -753,6 +769,7 @@ impl<'a> Visitor for Collector<'a> {
             is_excluded_compile,
             allow_pickle_kw_line,
             data_taint,
+            dest_taint,
             command_taint,
             first_arg_taint,
             receiver_taint,
@@ -778,6 +795,7 @@ impl<'a> Visitor for Collector<'a> {
         let has_diagnostic =
             crate::ast_helpers::handler_has_diagnostic(&node.body, node.name.as_deref());
         let is_fallback = crate::ast_helpers::is_fallback_handler(&node.body);
+        let returns_error_response = crate::ast_helpers::handler_returns_error_response(&node.body);
         self.out.excepts.push(ExceptRec {
             line,
             is_bare,
@@ -786,6 +804,7 @@ impl<'a> Visitor for Collector<'a> {
             single_continue,
             has_diagnostic,
             is_fallback,
+            returns_error_response,
         });
         self.generic_visit_excepthandler_except_handler(node);
     }

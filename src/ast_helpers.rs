@@ -4,6 +4,7 @@
 //! rustpython-ast tracks byte offsets (`TextSize`/`TextRange`) rather than
 //! Python's native `lineno`, so `LineIndex` bridges the two.
 
+use regex::Regex;
 use rustpython_ast::text_size::TextSize;
 use rustpython_ast::{
     Arguments, Comprehension, Constant, Expr, ExprCall, ExprLambda, Keyword, ModModule, Operator,
@@ -12,6 +13,7 @@ use rustpython_ast::{
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 pub struct LineIndex {
     line_starts: Vec<u32>,
@@ -811,4 +813,58 @@ pub fn concat_lead(target: &Expr) -> Option<&Expr> {
         && !matches!(ops[0], Expr::Constant(_))
         && ops[1..].iter().all(|o| is_safe_tail(o)))
     .then(|| ops[0])
+}
+
+/// The last segment of a call that builds an error response -- mirrors
+/// `ast_helpers._ERROR_RESPONSE_RE`.
+static ERROR_RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|_)(?:error|errors|not_found|notfound|forbidden|bad_request|badrequest|unauthori[sz]ed|abort|fail|failure|failed|4\d\d|5\d\d)(?:_|$)|^HTTPException$|^HttpResponse(?:NotFound|Forbidden|BadRequest|ServerError|Gone)$",
+    )
+    .unwrap()
+});
+
+fn is_error_response(expr: Option<&Expr>) -> bool {
+    let Some(Expr::Call(c)) = expr else {
+        return false;
+    };
+    let full = full_attr(&c.func);
+    if ERROR_RESPONSE_RE.is_match(full.rsplit('.').next().unwrap_or("")) {
+        return true;
+    }
+    c.keywords.iter().any(|k| {
+        k.arg
+            .as_ref()
+            .is_some_and(|a| a.as_str() == "status" || a.as_str() == "status_code")
+            && matches!(&k.value, Expr::Constant(kc) if matches!(&kc.value, Constant::Int(i) if *i >= 400.into()))
+    })
+}
+
+struct ErrorReturnFinder {
+    found: bool,
+}
+
+impl Visitor for ErrorReturnFinder {
+    fn visit_stmt_return(&mut self, node: rustpython_ast::StmtReturn) {
+        if is_error_response(node.value.as_deref()) {
+            self.found = true;
+        }
+    }
+    fn visit_stmt_function_def(&mut self, _node: StmtFunctionDef) {}
+    fn visit_stmt_async_function_def(&mut self, _node: StmtAsyncFunctionDef) {}
+    fn visit_stmt_class_def(&mut self, _node: StmtClassDef) {}
+    fn visit_expr_lambda(&mut self, _node: ExprLambda) {}
+}
+
+/// The handler answers the request with an error -- mirrors
+/// `ast_helpers._handler_returns_error_response`.
+pub fn handler_returns_error_response(body: &[Stmt]) -> bool {
+    let mut finder = ErrorReturnFinder { found: false };
+    for stmt in body {
+        finder.visit_stmt(stmt.clone());
+        if finder.found {
+            return true;
+        }
+    }
+    false
 }
