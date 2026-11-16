@@ -219,22 +219,27 @@ precision at one finding per 1,000 lines. The next blind application
 seven findings per 1,000 lines: nearly every finding there was a deliberate
 `except Exception:` fallback, reported by two checks at once. After the
 handler round (a handler is reported once, and one that only substitutes
-a value is not reported as unlogged) the corpus is six apps and 213,000
-lines at 11% strict and 30% lenient, 1.1 findings per 1,000 lines (18% and
-50% at `--confidence-min high`, 0.5 per 1,000). The third blind
-application (CTFd, Flask, 24,000 lines) reads 0% strict and 15% lenient at
-1.4 per 1,000 lines: no tool found a vulnerability in it, and the 28 false
-findings are listed by shape in `benchmark/README.md`. The blind numbers
-are the ones a team should expect today (`ROADMAP.md`, D9).
+a value is not reported as unlogged) the corpus was six apps at 11% strict
+and 30% lenient, 1.1 findings per 1,000 lines. The third blind application
+(CTFd, Flask, 24,000 lines) read 0% strict and 15% lenient at 1.4 per
+1,000 lines; after its round (guards on expressions such as
+`is_safe_url(request.args.get("next"))`, `safe_join()` as a sanitiser,
+`print()` and `abort()` as handling, and `# noqa: Sxxx` honoured) the
+corpus is seven apps and 237,000 lines at 12% strict and 38% lenient, 0.8
+findings per 1,000 lines (19% and 55% at `--confidence-min high`, 0.5 per
+1,000). The fourth blind application (Mealie, FastAPI, 43,000 lines) reads
+4% strict and 13% lenient at 1.6 per 1,000 lines, with three real
+log-injection findings no other tool reports. The blind numbers are the
+ones a team should expect today (`ROADMAP.md`, D10).
 
 So on those apps fenceline finds more than Bandit with fewer false
 positives, and at `--confidence-min high` it finds twice what Semgrep's
 community rules do at nearly the same precision. What still separates it
 from a full replacement, in the order we intend to close it:
 
-- Precision on ordinary code is 11% strict and 30% lenient (18% and 50%
-  at `--confidence-min high`) on six apps, and three blind applications
-  in a row have read below the bar: 1.4 findings per 1,000 lines at 15%
+- Precision on ordinary code is 12% strict and 38% lenient (19% and 55%
+  at `--confidence-min high`) on seven apps, and four blind applications
+  in a row have read below the bar: 1.6 findings per 1,000 lines at 13%
   lenient on the latest, where the bar is one at 35%. The vulnerable apps
   test recall;
   the clean corpus shows what a team turning fenceline on sees first. Until
@@ -375,6 +380,11 @@ B-numbers:
 ```python
 pickle.loads(data)  # nosec CWE-502 -- trusted internal cache, not user input
 ```
+
+Lines already adjudicated for Bandit or for Ruff's `S` rules stay quiet
+too: `# nosec B608` and `# noqa: S608` suppress the fenceline checks that
+cover the same rule (`CWE-89` here). A bare `# noqa` or a non-security
+code such as `E501` suppresses nothing.
 
 ## Design
 
