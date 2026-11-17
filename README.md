@@ -1,8 +1,8 @@
 # fenceline
 
 Zero-day security scanner for Python codebases, implemented in Rust. One
-native binary — `cargo install fenceline && fenceline` scans whatever's under
-the current directory, no Python runtime and no project-specific setup
+native binary — one installer command (or `cargo install fenceline`) and
+`fenceline` scans whatever's under the current directory, no Python runtime and no project-specific setup
 required.
 
 The aim is to be the one scanner a Python project runs instead of Bandit and
@@ -42,11 +42,31 @@ description.
 
 ## Installation
 
+Prebuilt binaries for Apple Silicon and Intel macOS, x64 and ARM64 Linux, and
+x64 Windows are attached to every
+[GitHub release](https://github.com/lvalverdeb/fenceline-rs/releases/latest).
+The installer scripts pick the right one, check its SHA-256 and put
+`fenceline` in `$CARGO_HOME/bin` (`~/.cargo/bin` by default), adding that
+directory to your `PATH` if needed:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lvalverdeb/fenceline-rs/releases/latest/download/fenceline-installer.sh | sh
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/lvalverdeb/fenceline-rs/releases/latest/download/fenceline-installer.ps1 | iex"
+```
+
+Replace `latest` with a tag such as `v1.14.0` to pin a version; the release
+page lists the archives and their SHA-256 checksums for a manual download.
+With a Rust toolchain you can also build from crates.io:
+
 ```bash
 cargo install fenceline
 ```
 
-This installs a binary named `fenceline` (matching the Python CLI's command name and the crate name).
+Either way the binary is named `fenceline` (matching the Python CLI's command
+name and the crate name).
 
 ## Usage
 
@@ -160,7 +180,8 @@ appear as code scanning alerts, with GitHub tracking which are new on a pull
 request:
 
 ```yaml
-- run: cargo install fenceline && fenceline --sarif -q > fenceline.sarif || true
+- run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lvalverdeb/fenceline-rs/releases/latest/download/fenceline-installer.sh | sh
+- run: fenceline --sarif -q > fenceline.sarif || true
 - uses: github/codeql-action/upload-sarif@v3
   with:
     sarif_file: fenceline.sarif
