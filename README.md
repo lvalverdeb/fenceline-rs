@@ -175,7 +175,7 @@ with cargo and scans the working tree whenever a Python file is staged:
 ```yaml
 repos:
   - repo: https://github.com/lvalverdeb/fenceline-rs
-    rev: v1.13.0
+    rev: v1.14.0
     hooks:
       - id: fenceline
         # args: [--fail-on, critical, --baseline, fenceline-baseline.json]
@@ -192,7 +192,7 @@ three checks, and closing them put 1.8.0 at 92% precision and 94% recall
 there. On all four apps 1.9.0 is at 92% precision and 93% recall,
 against Bandit's 89% / 76% and Semgrep's 99% / 33% on the same ground truth,
 and 97% precision at `--confidence-min high`. This port produces the
-identical findings there (206 at 1.13.0), so its numbers are
+identical findings there (205 at 1.14.0), so its numbers are
 the same; run it against
 the binary with
 `FENCELINE_CMD=target/release/fenceline ../fenceline/benchmark/run.sh`. The
